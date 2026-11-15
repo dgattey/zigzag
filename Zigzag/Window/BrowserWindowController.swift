@@ -194,6 +194,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate {
         tabManager.host = self
         tokens.append(tabManager.changed.observe { [weak self] change in self?.tabManagerChanged(change) })
         tokens.append(Library.shared.changed.observe { [weak self] in self?.libraryChanged() })
+        tokens.append(Library.shared.sidebarUIChanged.observe { [weak self] in
+            guard let self else { return }
+            self.sidebar.list.reload(animated: self.window?.isVisible == true)
+            self.numberHints?.placesChanged()
+        })
         // Tools above the page turned on or off (Settings › Developer): the page you're on gains or loses them.
         tokens.append(DeveloperTools.changed.observe { [weak self] in self?.showDeveloperBarTools() })
         // Reduce Transparency turned on or off while Zigzag is open: the window follows at once.

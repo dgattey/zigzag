@@ -1391,13 +1391,14 @@ enum DebugBridge {
             let folders = Library.shared.folders(in: controller.tabManager.currentSpaceID)
             if let folder = folders.first(where: { $0.name == arg }) ?? (arg.isEmpty ? folders.first : nil) {
                 let start = CACurrentMediaTime()
-                controller.listSetFolderOpen(folder.id, !folder.isOpen)
+                let wasOpen = Library.shared.isFolderOpen(folder.id)
+                controller.listSetFolderOpen(folder.id, !wasOpen)
                 controller.window?.contentView?.layoutSubtreeIfNeeded()
                 controller.window?.displayIfNeeded()
                 CATransaction.flush()
                 let shown = (CACurrentMediaTime() - start) * 1000
                 DispatchQueue.main.async {
-                    debugLog(String(format: "togglefolder %@ %@ => %.1f ms, next turn %.1f ms, rows %d", folder.name, folder.isOpen ? "shut" : "open",
+                    debugLog(String(format: "togglefolder %@ %@ => %.1f ms, next turn %.1f ms, rows %d", folder.name, wasOpen ? "shut" : "open",
                                     shown, (CACurrentMediaTime() - start) * 1000, controller.sidebar.list.debugRows().count))
                 }
             }

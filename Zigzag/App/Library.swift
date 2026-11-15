@@ -17,14 +17,10 @@ struct BookmarkFolder: Codable, Identifiable, Equatable {
     var id = UUID()
     var name: String
     var bookmarkIDs: [UUID] = []
-    var isOpen = true
     /// Drawn inside the folder: an SF Symbol's name, or an emoji. Nil: a plain folder.
     var icon: String? = nil
     /// The folder this one is inside. Nil: it sits among the space's pinned pages.
     var parentID: UUID? = nil
-    /// The pages that were open when it was shut: shut on purpose, it hides them too (#154), though pages opened
-    /// after still show under it (#94). Nil while it's open.
-    var tucked: [UUID]? = nil
 }
 
 extension Array where Element == BookmarkFolder {
@@ -166,6 +162,11 @@ nonisolated struct PinnedSplit: Codable, Sendable {
 /// doesn't count as changing the library, and ⌘Z for what came before still works.
 extension PinnedSplit: Equatable {
     static func == (a: PinnedSplit, b: PinnedSplit) -> Bool { a.ids == b.ids }
+
+    nonisolated func hasSameLayout(as other: PinnedSplit) -> Bool {
+        ids == other.ids && ratio == other.ratio && vertical == other.vertical
+            && (!isGroup || (regions == other.regions && otherRatio == other.otherRatio))
+    }
 }
 
 struct SpaceInfo: Codable, Identifiable, Equatable {
@@ -310,7 +311,7 @@ struct SpaceInfo: Codable, Identifiable, Equatable {
     /// becomes a see-through gray at the shade it had.
     var upgraded: SpaceInfo {
         var space = self
-        if hue == nil, color.isNeutral, tint == nil { space.tint = 0 }
+        if hue == nil, color.isKnown, color.isNeutral, tint == nil { space.tint = 0 }
         if glass == true {
             space.glass = nil
             space.translucency = translucency ?? Self.glassTranslucency
@@ -384,19 +385,71 @@ struct SpaceInfo: Codable, Identifiable, Equatable {
     }
 }
 
-enum SearchEngine: String, Codable, CaseIterable {
-    case google, duckDuckGo, brave, bing, kagi, ecosia, startpage, perplexity, yahoo, baidu, yandex, custom
-    /// The one an extension gives ("ChatGPT search"), while it's on: see ExtensionSearchProvider.
-    case fromExtension
+nonisolated struct SearchEngine: RawRepresentable, Codable, CaseIterable, Hashable, Sendable {
+    private enum Known: String, CaseIterable, Sendable {
+        case google, duckDuckGo, brave, bing, kagi, ecosia, startpage, perplexity, yahoo, baidu, yandex, custom
+        /// The one an extension gives ("ChatGPT search"), while it's on: see ExtensionSearchProvider.
+        case fromExtension
+    }
+
+    let rawValue: String
+    private let known: Known?
+
+    private init(known: Known) {
+        self.rawValue = known.rawValue
+        self.known = known
+    }
+
+    private init(unknownRaw: String) {
+        self.rawValue = unknownRaw
+        self.known = nil
+    }
+
+    init?(rawValue: String) {
+        guard let known = Known(rawValue: rawValue) else { return nil }
+        self.init(known: known)
+    }
+
+    /// Reads any saved string, keeping unknown future engine names intact so saving here never clobbers them.
+    static func decoded(_ rawValue: String) -> SearchEngine {
+        Known(rawValue: rawValue).map(Self.init(known:)) ?? (rawValue.isEmpty ? .google : Self(unknownRaw: rawValue))
+    }
+
+    var isKnown: Bool { known != nil }
+    private var resolved: Known { known ?? .google }
+
+    static let google = Self(known: .google)
+    static let duckDuckGo = Self(known: .duckDuckGo)
+    static let brave = Self(known: .brave)
+    static let bing = Self(known: .bing)
+    static let kagi = Self(known: .kagi)
+    static let ecosia = Self(known: .ecosia)
+    static let startpage = Self(known: .startpage)
+    static let perplexity = Self(known: .perplexity)
+    static let yahoo = Self(known: .yahoo)
+    static let baidu = Self(known: .baidu)
+    static let yandex = Self(known: .yandex)
+    static let custom = Self(known: .custom)
+    static let fromExtension = Self(known: .fromExtension)
+
+    static let allCases: [SearchEngine] = Known.allCases.map(Self.init(known:))
 
     /// Zigzag's own engines, the ones Settings always lists.
     static var builtIn: [SearchEngine] { allCases.filter { $0 != .fromExtension } }
 
-    /// An engine this version doesn't know (saved by a newer one) reads as Google, rather than making the whole
-    /// library unreadable and losing every space with it.
+    /// An engine this version doesn't know (saved by a newer one) searches as Google while keeping its saved name,
+    /// rather than making the whole library unreadable or clobbering the choice on save.
     init(from decoder: Decoder) throws {
-        self = SearchEngine(rawValue: try decoder.singleValueContainer().decode(String.self)) ?? .google
+        self = Self.decoded(try decoder.singleValueContainer().decode(String.self))
     }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    static func == (a: SearchEngine, b: SearchEngine) -> Bool { a.rawValue == b.rawValue }
+    func hash(into hasher: inout Hasher) { hasher.combine(rawValue) }
 
     /// A search address of your own, with %s where the words go ("https://example.com/search?q=%s").
     static var customTemplate: String {
@@ -416,8 +469,8 @@ enum SearchEngine: String, Codable, CaseIterable {
         return true
     }
 
-    var name: String {
-        switch self {
+    @MainActor var name: String {
+        switch resolved {
         case .google: "Google"
         case .duckDuckGo: "DuckDuckGo"
         case .brave: "Brave Search"
@@ -436,10 +489,10 @@ enum SearchEngine: String, Codable, CaseIterable {
         }
     }
 
-    func searchURL(_ query: String) -> URL {
+    @MainActor func searchURL(_ query: String) -> URL {
         var components: URLComponents
         var key = "q"
-        switch self {
+        switch resolved {
         case .google: components = URLComponents(string: "https://www.google.com/search")!
         case .duckDuckGo: components = URLComponents(string: "https://duckduckgo.com/")!
         case .brave: components = URLComponents(string: "https://search.brave.com/search")!
@@ -465,8 +518,8 @@ enum SearchEngine: String, Codable, CaseIterable {
     }
 
     /// The engine's home page, for its icon.
-    var homeURL: URL {
-        switch self {
+    @MainActor var homeURL: URL {
+        switch resolved {
         case .google: URL(string: "https://www.google.com")!
         case .duckDuckGo: URL(string: "https://duckduckgo.com")!
         case .brave: URL(string: "https://search.brave.com")!
@@ -486,9 +539,9 @@ enum SearchEngine: String, Codable, CaseIterable {
         }
     }
 
-    func suggestionsURL(_ query: String) -> URL? {
+    @MainActor func suggestionsURL(_ query: String) -> URL? {
         var components: URLComponents
-        switch self {
+        switch resolved {
         case .google:
             components = URLComponents(string: "https://suggestqueries.google.com/complete/search")!
             components.queryItems = [.init(name: "client", value: "firefox"), .init(name: "q", value: query)]
@@ -522,6 +575,8 @@ enum SearchEngine: String, Codable, CaseIterable {
 final class Library {
     static let shared = Library()
 
+    let root: URL
+
     private struct Stored: Codable {
         var spaces: [SpaceInfo]
         var favorites: [Bookmark]?
@@ -549,24 +604,64 @@ final class Library {
     /// profile for now. Said once, at launch.
     let profilesWereSetAside: Bool
 
+    private(set) var sidebarUI: SidebarUIState
+    private var savedSidebarUI: SidebarUIState
+
+    nonisolated enum SplitLocation: Equatable, Sendable {
+        case favorites
+        case space(UUID)
+    }
+
+    nonisolated struct SplitLayoutChange: Equatable, Sendable {
+        let location: SplitLocation
+        let split: PinnedSplit
+
+        static func == (a: SplitLayoutChange, b: SplitLayoutChange) -> Bool {
+            a.location == b.location && a.split.hasSameLayout(as: b.split)
+        }
+    }
+
     /// Fires whenever spaces or bookmarks change.
     let changed = Signal<Void>()
+    /// Fires when device-local sidebar fold or tuck state changes, without dirtying `Library.json` or waking bookmark sync.
+    let sidebarUIChanged = Signal<Void>()
+    /// Fires when a pinned or favorite split's layout changes, including resizes that don't invalidate undo snapshots.
+    let splitLayoutChanged = Signal<SplitLayoutChange>()
     /// Whether the library was read from its file, not started afresh (a first run, or a file that couldn't be read).
     private let wasRead: Bool
 
-    private init() {
-        let hadProfiles = FileManager.default.fileExists(atPath: Paths.profiles.path)
-        let readProfiles = hadProfiles ? JSONStore.load(ProfileDirectory.self, from: Paths.profiles) : nil
-        directory = readProfiles ?? ProfileDirectory()
-        profilesWereSetAside = hadProfiles && readProfiles == nil
+    init(root: URL = Paths.support) {
+        self.root = root
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let loadedProfiles = ProfileDirectory.load(in: root)
+        directory = loadedProfiles.directory
+        profilesWereSetAside = loadedProfiles.wasSetAside
         savedDirectory = directory
-        if let stored = JSONStore.load(Stored.self, from: Paths.library), !stored.spaces.isEmpty {
+        let sidebarUIURL = Paths.sidebarUI(in: root)
+        if case .loaded(let stored, let rawData) = JSONStore.loadOutcome(Stored.self, from: Paths.library(in: root)), !stored.spaces.isEmpty {
             spaces = Self.keepingDefaultColors(stored.spaces.map(\.upgraded))
             favorites = stored.favorites ?? []
             favoriteSplits = stored.favoriteSplits ?? []
             searchEngine = stored.searchEngine
             importedFromArc = stored.importedFromArc ?? false
             wasRead = true
+            switch JSONStore.loadOutcome(SidebarUIState.self, from: sidebarUIURL) {
+            case .loaded(let ui, _):
+                sidebarUI = ui
+                savedSidebarUI = ui
+            case .missing:
+                let migrated = SidebarUIState.migratedFromLegacyLibraryJSON(rawData)
+                sidebarUI = migrated.state
+                if JSONStore.save(migrated.state, to: sidebarUIURL) {
+                    savedSidebarUI = migrated.state
+                    if migrated.hadLegacyKeys { save() }
+                } else {
+                    savedSidebarUI = SidebarUIState()
+                }
+            case .unreadable:
+                sidebarUI = SidebarUIState()
+                savedSidebarUI = SidebarUIState()
+            }
             // What an older Zigzag may have left that this one doesn't allow.
             tidyFavorites()
         } else {
@@ -574,22 +669,42 @@ final class Library {
             spaces = [SpaceInfo(name: String(localized: "Personal", comment: "The name of the first space in a new Zigzag. People can rename it."), color: .sky, defaultColor: .sky)]
             searchEngine = .google
             importedFromArc = false
+            sidebarUI = SidebarUIState()
+            savedSidebarUI = SidebarUIState()
             saveNow()
         }
     }
 
+    isolated deinit {
+        saveDebouncer.cancel()
+        sidebarUIDebouncer.cancel()
+    }
+
     private let saveDebouncer = Debouncer(delay: 0.5, maxWait: 5)
+    private let sidebarUIDebouncer = Debouncer(delay: 0.25, maxWait: 2)
 
     func save() {
-        saveDebouncer.call { [self] in saveNow() }
+        saveDebouncer.call { [weak self] in self?.saveNow() }
+    }
+
+    func saveSidebarUI() {
+        sidebarUIDebouncer.call { [weak self] in self?.saveSidebarUINow() }
+    }
+
+    func saveSidebarUINow() {
+        sidebarUIDebouncer.cancel()
+        if sidebarUI != savedSidebarUI, JSONStore.save(sidebarUI, to: Paths.sidebarUI(in: root)) {
+            savedSidebarUI = sidebarUI
+        }
     }
 
     func saveNow() {
         saveDebouncer.cancel()
         JSONStore.save(Stored(spaces: spaces, favorites: favorites, favoriteSplits: favoriteSplits.isEmpty ? nil : favoriteSplits,
-                              searchEngine: searchEngine, importedFromArc: importedFromArc), to: Paths.library)
+                              searchEngine: searchEngine, importedFromArc: importedFromArc), to: Paths.library(in: root))
         // Only what reached the disk counts as saved: a write that failed is tried again with the next save.
-        if directory != savedDirectory, JSONStore.save(directory, to: Paths.profiles) { savedDirectory = directory }
+        if directory != savedDirectory, directory.save(in: root) { savedDirectory = directory }
+        saveSidebarUINow()
     }
 
     private func commit() {
@@ -598,15 +713,25 @@ final class Library {
         changed.send()
     }
 
+    private func commitSidebarUI() {
+        if holding > 0 { heldSidebarUI = true; return }
+        saveSidebarUI()
+        sidebarUIChanged.send()
+    }
+
     private var holding = 0
     private var held = false
+    private var heldSidebarUI = false
 
     /// Many changes as one: saved and shown once, at the end, not once for each (a hundred picked rows unpinned).
     func together(_ body: () -> Void) {
         holding += 1
         body()
         holding -= 1
-        if holding == 0, held { held = false; commit() }
+        if holding == 0 {
+            if held { held = false; commit() }
+            if heldSidebarUI { heldSidebarUI = false; commitSidebarUI() }
+        }
     }
 
     // MARK: Spaces
@@ -1180,7 +1305,7 @@ final class Library {
         if let inside, spaces[s].folders?.contains(where: { $0.id == inside }) == true {
             folder.parentID = inside
             // Open on the way in, so the new folder shows.
-            if let p = spaces[s].folders?.firstIndex(where: { $0.id == inside }) { spaces[s].folders?[p].isOpen = true; spaces[s].folders?[p].tucked = nil }
+            if sidebarUI.setFolderOpen(inside, true) { commitSidebarUI() }
         }
         spaces[s].folders = (spaces[s].folders ?? []) + [folder]
         tidyFolders(s)
@@ -1201,25 +1326,19 @@ final class Library {
         commit()
     }
 
+    func isFolderOpen(_ id: UUID) -> Bool { sidebarUI.isFolderOpen(id) }
+
+    func tuckedBookmarks(inFolder id: UUID) -> [UUID]? { sidebarUI.shutFolders[id.uuidString]?.tucked }
+
     /// Opens or shuts a folder. Shut, it keeps `tucking` (its pages open now) hidden with the rest.
     func setFolderOpen(_ id: UUID, _ open: Bool, tucking: Set<UUID> = []) {
-        guard let s = spaceIndex(ofFolder: id), let f = spaces[s].folders?.firstIndex(where: { $0.id == id }) else { return }
-        spaces[s].folders?[f].isOpen = open
-        spaces[s].folders?[f].tucked = open || tucking.isEmpty ? nil : tucking.sorted { $0.uuidString < $1.uuidString }
-        commit()
+        guard folder(id) != nil else { return }
+        if sidebarUI.setFolderOpen(id, open, tucking: tucking) { commitSidebarUI() }
     }
 
     /// A page opened again: it shows under its shut folder from now on, as any page opened there does.
     func untuck(_ bookmarkID: UUID) {
-        var changed = false
-        for s in spaces.indices {
-            for f in (spaces[s].folders ?? []).indices where spaces[s].folders?[f].tucked?.contains(bookmarkID) == true {
-                spaces[s].folders?[f].tucked?.removeAll { $0 == bookmarkID }
-                if spaces[s].folders?[f].tucked?.isEmpty == true { spaces[s].folders?[f].tucked = nil }
-                changed = true
-            }
-        }
-        if changed { commit() }
+        if sidebarUI.untuck(bookmarkID) { commitSidebarUI() }
     }
 
     /// The folder goes; what was in it (pages and folders) stays where it was, one level up.
@@ -1266,7 +1385,9 @@ final class Library {
         spaces[target].bookmarks.insert(contentsOf: moving, at: max(0, min(at, spaces[target].bookmarks.count)))
         folder.parentID = into
         spaces[s].folders?[f] = folder
-        if let p = into, let pi = spaces[target].folders?.firstIndex(where: { $0.id == p }) { spaces[target].folders?[pi].isOpen = true; spaces[target].folders?[pi].tucked = nil }
+        if let p = into, spaces[target].folders?.contains(where: { $0.id == p }) == true {
+            if sidebarUI.setFolderOpen(p, true) { commitSidebarUI() }
+        }
         if s != target {
             // Its subfolders go along.
             let travelling = Set([id] + inner)
@@ -1455,20 +1576,29 @@ final class Library {
     func setPinnedSplitLayout(_ layout: PinnedSplit) {
         let pages = Set(layout.ids)
         if let i = favoriteSplits.firstIndex(where: { Set($0.ids) == pages }) {
+            guard !favoriteSplits[i].hasSameLayout(as: layout) else { return }
             let swapped = favoriteSplits[i].ids != layout.ids
             favoriteSplits[i] = layout
             if swapped { tidyFavorites(); commit() } else { save() }
+            if let current = favoriteSplits.first(where: { Set($0.ids) == pages }) {
+                splitLayoutChanged.send(SplitLayoutChange(location: .favorites, split: current))
+            }
             return
         }
         for s in spaces.indices {
             guard let i = spaces[s].pinnedSplits?.firstIndex(where: { Set($0.ids) == pages }) else { continue }
+            guard spaces[s].pinnedSplits?[i].hasSameLayout(as: layout) != true else { return }
             let swapped = spaces[s].pinnedSplits?[i].ids != layout.ids
+            let spaceID = spaces[s].id
             spaces[s].pinnedSplits?[i] = layout
             if swapped {
                 tidyFolders(s)
                 commit()
             } else {
                 save()
+            }
+            if let current = spaces[s].pinnedSplits?.first(where: { Set($0.ids) == pages }) {
+                splitLayoutChanged.send(SplitLayoutChange(location: .space(spaceID), split: current))
             }
             return
         }
@@ -1667,6 +1797,8 @@ final class Library {
     func pruneProfileAssignments() {
         guard wasRead else { return }
         directory.prune(keeping: Set(spaces.map(\.id)).union(TabArchive.shared.entries.map(\.spaceID)), favorites: Set(favorites.map(\.id)))
+        let liveFolders = Set(spaces.flatMap { ($0.folders ?? []).map(\.id) })
+        if sidebarUI.prune(keepingFolders: liveFolders, bookmarks: allBookmarkIDs) { saveSidebarUI() }
         save()
     }
 
