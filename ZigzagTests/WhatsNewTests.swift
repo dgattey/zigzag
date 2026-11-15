@@ -77,7 +77,11 @@ struct WhatsNewTests {
 
     @Test func unknownSearchEngineKeepsTheLibrary() throws {
         let engine = try JSONDecoder().decode([SearchEngine].self, from: Data(#"["notanengine","kagi"]"#.utf8))
-        #expect(engine == [.google, .kagi])
+        #expect(!engine[0].isKnown && engine[0].rawValue == "notanengine")
+        #expect(engine[0].searchURL("q") == SearchEngine.google.searchURL("q"))
+        #expect(engine[1] == .kagi)
+        let reencoded = try JSONDecoder().decode([String].self, from: JSONEncoder().encode(engine))
+        #expect(reencoded == ["notanengine", "kagi"])
     }
 
     /// Issue references at a point's end become its issues; links in its words, credits among them, stay.

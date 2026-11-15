@@ -2,8 +2,49 @@ import AppKit
 
 /// The curated set of space tints. One color per space colors the whole window frame.
 /// Light values are pale enough for dark text, dark values deep enough for light text.
-enum SpaceColor: String, Codable, CaseIterable {
-    case snow, graphite, ink, sky, sage, sand, rose, lavender, mint, peach
+nonisolated struct SpaceColor: RawRepresentable, Codable, CaseIterable, Hashable, Sendable {
+    private enum Known: String, CaseIterable, Sendable {
+        case snow, graphite, ink, sky, sage, sand, rose, lavender, mint, peach
+    }
+
+    let rawValue: String
+    private let known: Known?
+
+    private init(known: Known) {
+        self.rawValue = known.rawValue
+        self.known = known
+    }
+
+    private init(unknownRaw: String) {
+        self.rawValue = unknownRaw
+        self.known = nil
+    }
+
+    init?(rawValue: String) {
+        guard let known = Known(rawValue: rawValue) else { return nil }
+        self.init(known: known)
+    }
+
+    /// Reads any saved string, keeping unknown future color names intact so saving here never clobbers them.
+    static func decoded(_ rawValue: String) -> SpaceColor {
+        Known(rawValue: rawValue).map(Self.init(known:)) ?? (rawValue.isEmpty ? .graphite : Self(unknownRaw: rawValue))
+    }
+
+    var isKnown: Bool { known != nil }
+    private var resolved: Known { known ?? .graphite }
+
+    static let snow = Self(known: .snow)
+    static let graphite = Self(known: .graphite)
+    static let ink = Self(known: .ink)
+    static let sky = Self(known: .sky)
+    static let sage = Self(known: .sage)
+    static let sand = Self(known: .sand)
+    static let rose = Self(known: .rose)
+    static let lavender = Self(known: .lavender)
+    static let mint = Self(known: .mint)
+    static let peach = Self(known: .peach)
+
+    static let allCases: [SpaceColor] = Known.allCases.map(Self.init(known:))
 
     /// The color a new space or profile gets: the first with a hue that none has yet, else, once all are taken,
     /// the next of `fallback` in turn.
@@ -13,16 +54,26 @@ enum SpaceColor: String, Codable, CaseIterable {
     }
 
     /// Without a hue: pure white, gray and black. A gradient or a hue doesn't apply to them.
-    var isNeutral: Bool { self == .snow || self == .graphite || self == .ink }
+    var isNeutral: Bool {
+        switch resolved {
+        case .snow, .graphite, .ink: true
+        case .sky, .sage, .sand, .rose, .lavender, .mint, .peach: false
+        }
+    }
 
-    /// A colour this version doesn't know (saved by a newer one) reads as graphite, rather than making the whole
-    /// library unreadable.
+    /// A color this version doesn't know (saved by a newer one) reads as graphite while keeping its saved name,
+    /// rather than making the whole library unreadable.
     init(from decoder: Decoder) throws {
-        self = SpaceColor(rawValue: try decoder.singleValueContainer().decode(String.self)) ?? .graphite
+        self = Self.decoded(try decoder.singleValueContainer().decode(String.self))
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
     }
 
     var name: String {
-        switch self {
+        switch resolved {
         case .snow: String(localized: "White", comment: "Name of a curated space color, in the space editor.")
         case .graphite: String(localized: "Graphite", comment: "Name of a curated space color, in the space editor.")
         case .ink: String(localized: "Black", comment: "Name of a curated space color, in the space editor.")
@@ -38,8 +89,8 @@ enum SpaceColor: String, Codable, CaseIterable {
 
     /// Where each curated color sits on the wheel (red at 0). Chosen so the set reads as a family: neighbors far
     /// enough apart to tell at a glance, none of them loud.
-    private var wheelHue: Double? {
-        switch self {
+    private static func wheelHue(of known: Known) -> Double? {
+        switch known {
         case .snow, .graphite, .ink: nil
         case .sky: 0.585
         case .sage: 0.29
@@ -51,23 +102,29 @@ enum SpaceColor: String, Codable, CaseIterable {
         }
     }
 
+    private var wheelHue: Double? { Self.wheelHue(of: resolved) }
+
+    @MainActor private static let backgrounds: [Known: NSColor] = Dictionary(uniqueKeysWithValues: Known.allCases.map { known in
+        let color: NSColor
+        switch known {
+        // White and black are pure, day and night alike: the two you can count on to be exactly that.
+        case .snow: color = Tokens.Color.hex(0xFFFFFF)
+        case .graphite: color = Tokens.Color.dynamic(light: Tokens.Color.hex(0xE4E4E2), dark: Tokens.Color.hex(0x1F1F21))
+        case .ink: color = Tokens.Color.hex(0x000000)
+        case .sky, .sage, .sand, .rose, .lavender, .mint, .peach:
+            let h = wheelHue(of: known) ?? 0.6
+            // Blue reads louder than the others at the same chroma on a screen: sky is a step dustier.
+            let k = known == .sky ? 0.78 : 1
+            color = Tokens.Color.dynamic(light: tone(hue: h, lightness: Tokens.Frame.lightness, chroma: Tokens.Frame.chroma * k),
+                                         dark: tone(hue: h, lightness: Tokens.Frame.darkLightness, chroma: Tokens.Frame.darkChroma * k))
+        }
+        return (known, color)
+    })
+
     /// The window frame color: for the hues, one soft lightness and one gentle chroma in OKLCH (`Tokens.Frame`), so
     /// every curated color weighs the same and any two of them sit well side by side; a deep, quiet tint of the same
     /// hue at night.
-    var background: NSColor {
-        switch self {
-        // White and black are pure, day and night alike: the two you can count on to be exactly that.
-        case .snow: return Tokens.Color.hex(0xFFFFFF)
-        case .graphite: return Tokens.Color.dynamic(light: Tokens.Color.hex(0xE4E4E2), dark: Tokens.Color.hex(0x1F1F21))
-        case .ink: return Tokens.Color.hex(0x000000)
-        default:
-            let h = wheelHue ?? 0.6
-            // Blue reads louder than the others at the same chroma on a screen: sky is a step dustier.
-            let k = self == .sky ? 0.78 : 1
-            return Tokens.Color.dynamic(light: Self.tone(hue: h, lightness: Tokens.Frame.lightness, chroma: Tokens.Frame.chroma * k),
-                                        dark: Self.tone(hue: h, lightness: Tokens.Frame.darkLightness, chroma: Tokens.Frame.darkChroma * k))
-        }
-    }
+    @MainActor var background: NSColor { Self.backgrounds[resolved]! }
 
     /// A wheel hue at an OKLCH lightness and chroma, eased off where a screen can't show that much color.
     static func tone(hue: Double, lightness: Double, chroma: Double) -> NSColor {
@@ -85,7 +142,7 @@ enum SpaceColor: String, Codable, CaseIterable {
     /// Any hue, at the same tuned lightness as the curated tints, so every choice looks right in both modes.
     static let defaultIntensity = 0.4
 
-    static func background(hue: Double, intensity: Double = defaultIntensity) -> NSColor {
+    @MainActor static func background(hue: Double, intensity: Double = defaultIntensity) -> NSColor {
         let t = min(max(intensity, 0), 1)
         // At the default strength, exactly a curated color's softness; stronger or fainter around it.
         let k = 0.4 + 1.5 * t
@@ -162,34 +219,38 @@ enum SpaceColor: String, Codable, CaseIterable {
         return atan2(lab.b, lab.a)
     }
 
-    static func swatch(hue: Double) -> NSColor {
+    @MainActor static func swatch(hue: Double) -> NSColor {
         Tokens.Color.dynamic(light: NSColor(hue: hue, saturation: 0.5, brightness: 0.8, alpha: 1),
                              dark: NSColor(hue: hue, saturation: 0.45, brightness: 0.85, alpha: 1))
     }
 
     /// The hue of this tint, for placing it on the slider.
-    var hue: Double {
+    @MainActor var hue: Double {
         if let wheelHue { return wheelHue }
         let c = (swatch.usingColorSpace(.sRGB) ?? swatch)
         return Double(c.hueComponent)
     }
 
-    /// A stronger version of the color, for small swatches and the space dot: the same hue, deeper and richer.
-    var swatch: NSColor {
-        switch self {
-        case .snow: return Tokens.Color.dynamic(light: Tokens.Color.hex(0xFFFFFF), dark: Tokens.Color.hex(0xF2F2F7))
-        case .graphite: return Tokens.Color.dynamic(light: Tokens.Color.hex(0x8E8E93), dark: Tokens.Color.hex(0x98989D))
-        case .ink: return Tokens.Color.dynamic(light: Tokens.Color.hex(0x1C1C1E), dark: Tokens.Color.hex(0x000000))
-        default:
-            let h = wheelHue ?? 0.6
-            return Tokens.Color.dynamic(light: Self.tone(hue: h, lightness: 0.7, chroma: 0.105),
-                                        dark: Self.tone(hue: h, lightness: 0.76, chroma: 0.095))
+    @MainActor private static let swatches: [Known: NSColor] = Dictionary(uniqueKeysWithValues: Known.allCases.map { known in
+        let color: NSColor
+        switch known {
+        case .snow: color = Tokens.Color.dynamic(light: Tokens.Color.hex(0xFFFFFF), dark: Tokens.Color.hex(0xF2F2F7))
+        case .graphite: color = Tokens.Color.dynamic(light: Tokens.Color.hex(0x8E8E93), dark: Tokens.Color.hex(0x98989D))
+        case .ink: color = Tokens.Color.dynamic(light: Tokens.Color.hex(0x1C1C1E), dark: Tokens.Color.hex(0x000000))
+        case .sky, .sage, .sand, .rose, .lavender, .mint, .peach:
+            let h = wheelHue(of: known) ?? 0.6
+            color = Tokens.Color.dynamic(light: tone(hue: h, lightness: 0.7, chroma: 0.105),
+                                         dark: tone(hue: h, lightness: 0.76, chroma: 0.095))
         }
-    }
+        return (known, color)
+    })
+
+    /// A stronger version of the color, for small swatches and the space dot: the same hue, deeper and richer.
+    @MainActor var swatch: NSColor { Self.swatches[resolved]! }
 }
 
 /// Björn Ottosson's OKLab, the perceptual space behind `SpaceColor.paint` and `SpaceColor.shade`.
-enum OKLab {
+nonisolated enum OKLab {
     static func rgb(l: Double, a: Double, b: Double) -> [Double] {
         let l1 = pow(l + 0.3963377774 * a + 0.2158037573 * b, 3)
         let m1 = pow(l - 0.1055613458 * a - 0.0638541728 * b, 3)

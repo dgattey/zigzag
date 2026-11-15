@@ -69,7 +69,11 @@ struct ExtensionSearchProvider: Equatable {
 
     /// The engine you had before choosing an extension's, to go back to when it goes.
     static var previousEngine: SearchEngine {
-        get { UserDefaults.standard.string(forKey: previousKey).flatMap(SearchEngine.init(rawValue:)).flatMap { $0 == .fromExtension ? nil : $0 } ?? .google }
+        get {
+            guard let raw = UserDefaults.standard.string(forKey: previousKey) else { return .google }
+            let decoded = SearchEngine.decoded(raw)
+            return decoded == .fromExtension ? .google : decoded
+        }
         set { UserDefaults.standard.set(newValue == .fromExtension ? nil : newValue.rawValue, forKey: previousKey) }
     }
 
