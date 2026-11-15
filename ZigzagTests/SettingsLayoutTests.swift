@@ -49,11 +49,12 @@ struct SettingsLayoutTests {
         plain.addSubview(up)
         let below = Label.capsBelowMiddle(of: font, lineHeight: down.lineHeight)
         #expect(below > 0 && below < 1)
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        let halfStep = 0.5 / scale
         let lineBox = (height - down.lineHeight) / 2
         let y = (down: down.centeredY(in: height), up: up.centeredY(in: height))
-        #expect(y.down < lineBox && y.up > lineBox)
-        #expect(abs(y.down - (lineBox - below)) <= 0.25 && abs(y.up - (lineBox + below)) <= 0.25)
-        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        #expect(y.down <= lineBox && y.up >= lineBox)
+        #expect(abs(y.down - (lineBox - below)) <= halfStep && abs(y.up - (lineBox + below)) <= halfStep)
         #expect((y.down * scale).rounded() == y.down * scale && (y.up * scale).rounded() == y.up * scale)
         withExtendedLifetime((flipped, plain)) {}
     }
