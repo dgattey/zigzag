@@ -1,10 +1,13 @@
 import Foundation
+import os
 import OSLog
+import Security
 import Testing
 @testable import Zigzag
 
-/// The vault against the real data protection keychain. Each test uses its own label and no iCloud sync, so the
-/// person's saved passwords are never seen, changed or synced, and everything is deleted afterwards.
+/// The vault against the data protection keychain when signed, or its automatic ephemeral fallback on unsigned runs.
+/// Each test uses its own label and no iCloud sync, so the person's saved passwords are never seen, changed or synced,
+/// and everything is deleted afterwards.
 @Suite(.serialized) struct PasswordStoreTests {
     let store = PasswordStore(label: "Zigzag Tests \(UUID().uuidString)", synchronizable: false)
     let github = Origin(URL(string: "https://github.com/login"))!
@@ -42,7 +45,7 @@ import Testing
         let saved = try await store.save(origin: github, username: "octocat", password: SecretString("a"))
         try await store.delete(saved.id)
         #expect(try await store.all().isEmpty)
-        await #expect(throws: PasswordStore.Failure.self) { try await store.password(for: saved.id) }
+        await #expect(throws: PasswordStore.Failure.notFound) { try await store.password(for: saved.id) }
         await store.deleteAll()
     }
 
@@ -50,9 +53,60 @@ import Testing
         #expect(await !store.neverSaves(on: github))
         await store.setNeverSave(true, on: github)
         #expect(await store.neverSaves(on: github))
+        #expect(await store.neverSaveSites() == [github])
         await store.setNeverSave(false, on: github)
         #expect(await !store.neverSaves(on: github))
+        #expect(await store.neverSaveSites().isEmpty)
         await store.deleteAll()
+    }
+
+    // MARK: Missing entitlement fallback
+
+    @Test func missingEntitlementFallsBackToEphemeralVault() async throws {
+        let fallbackStore = PasswordStore(vault: KeychainPasswordVault(label: "unentitled", synchronizable: false,
+                                                                      ops: .always(errSecMissingEntitlement)))
+        #expect(await !fallbackStore.isEphemeral)
+        let saved = try await fallbackStore.save(origin: github, username: "octocat", password: SecretString("ephemeral-secret"))
+        #expect(await fallbackStore.isEphemeral)
+        #expect(try await fallbackStore.all().map(\.id) == [saved.id])
+        #expect(try await fallbackStore.password(for: saved.id).matches(SecretString("ephemeral-secret")))
+        await fallbackStore.setNeverSave(true, on: github)
+        #expect(await fallbackStore.neverSaves(on: github))
+        #expect(await fallbackStore.neverSaveSites() == [github])
+        await fallbackStore.deleteAll()
+        #expect(try await fallbackStore.all().isEmpty)
+        #expect(await fallbackStore.neverSaveSites().isEmpty)
+    }
+
+    @Test func otherKeychainErrorsStillThrowWithoutSwappingVault() async {
+        let lockedStore = PasswordStore(vault: KeychainPasswordVault(label: "locked", synchronizable: false,
+                                                                    ops: .always(errSecInteractionNotAllowed)))
+        await #expect(throws: PasswordStore.Failure.keychain(errSecInteractionNotAllowed)) {
+            _ = try await lockedStore.all()
+        }
+        await #expect(throws: PasswordStore.Failure.keychain(errSecInteractionNotAllowed)) {
+            _ = try await lockedStore.save(origin: github, username: "octocat", password: SecretString("pw"))
+        }
+        #expect(await !lockedStore.isEphemeral)
+    }
+
+    @Test func missingEntitlementAfterKeychainWorkedDoesNotWipeSession() async throws {
+        let calls = OSAllocatedUnfairLock(initialState: 0)
+        let ops = KeychainOps(
+            copyMatching: { _, _ in
+                let step = calls.withLock { count -> Int in count += 1; return count }
+                return step == 1 ? errSecItemNotFound : errSecMissingEntitlement
+            },
+            add: { _, _ in errSecMissingEntitlement },
+            update: { _, _ in errSecMissingEntitlement },
+            delete: { _ in errSecMissingEntitlement }
+        )
+        let activeStore = PasswordStore(vault: KeychainPasswordVault(label: "active", synchronizable: false, ops: ops))
+        #expect(try await activeStore.all().isEmpty)
+        await #expect(throws: PasswordStore.Failure.keychain(errSecMissingEntitlement)) {
+            _ = try await activeStore.save(origin: github, username: "octocat", password: SecretString("pw"))
+        }
+        #expect(await !activeStore.isEphemeral)
     }
 
     // MARK: Never in plain text
