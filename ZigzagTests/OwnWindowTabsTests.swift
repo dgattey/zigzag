@@ -6,25 +6,32 @@ import Testing
 /// are, a split or tile group goes along whole, and a window left with no tabs is one that closes. Sessions saved
 /// by 0.8.7 beta 1, when every window showed the same tabs (#162), come back with every tab.
 @MainActor struct OwnWindowTabsTests {
-    private var space: UUID { Library.shared.spaces[0].id }
+    private let space = UUID()
 
-    /// Two windows' tabs, closed when the test is done.
-    private func windows(_ body: (TabManager, TabManager) throws -> Void) rethrows {
-        let a = TabManager(spaceID: space)
-        let b = TabManager(spaceID: space)
+    /// Two windows' tabs in an isolated library, closed and cleaned up when the test is done.
+    private func windows(_ body: (TabManager, TabManager, Library) throws -> Void) rethrows {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("zigzag-own-tabs-\(UUID().uuidString)", isDirectory: true)
+        let library = Library(root: root)
+        let profiles = Profiles(library: library)
+        let home = library.spaces[0].id
+        let a = TabManager(spaceID: home, library: library, profiles: profiles)
+        let b = TabManager(spaceID: home, library: library, profiles: profiles)
         defer {
             b.invalidate()
             a.invalidate()
+            library.saveNow()
+            try? FileManager.default.removeItem(at: root)
         }
-        try body(a, b)
+        try body(a, b, library)
     }
 
-    private func ids(_ manager: TabManager) -> [UUID] { manager.tabs(in: space).map(\.id) }
+    private func ids(_ manager: TabManager) -> [UUID] { manager.tabs(in: manager.currentSpaceID).map(\.id) }
 
     // MARK: Windows' own tabs
 
     @Test func aTabOpenedInOneWindowIsOnlyThere() {
-        windows { a, b in
+        windows { a, b, _ in
+            let space = a.currentSpaceID
             let tab = a.newTab(url: nil, spaceID: space, select: false)
             #expect(a.tab(with: tab.id) === tab)
             #expect(b.tab(with: tab.id) == nil)
@@ -35,7 +42,8 @@ import Testing
     }
 
     @Test func aMovedTabLeavesOneWindowForTheOtherAsItIs() {
-        windows { a, b in
+        windows { a, b, _ in
+            let space = a.currentSpaceID
             let stays = a.newTab(url: nil, spaceID: space, select: false)
             let tab = a.newTab(url: nil, spaceID: space)
             let there = b.newTab(url: nil, spaceID: space)
@@ -55,7 +63,8 @@ import Testing
     }
 
     @Test func movingBackPutsItWhereItWas() {
-        windows { a, b in
+        windows { a, b, _ in
+            let space = a.currentSpaceID
             let tabs = (0..<3).map { _ in a.newTab(url: nil, spaceID: space, select: false) }
             let before = ids(a)
             let place = before.firstIndex(of: tabs[1].id) ?? 0
@@ -68,7 +77,8 @@ import Testing
     }
 
     @Test func aSplitMovesWholeAndStaysASplit() {
-        windows { a, b in
+        windows { a, b, _ in
+            let space = a.currentSpaceID
             let left = a.newTab(url: nil, spaceID: space, select: false)
             let right = a.newTab(url: nil, spaceID: space, select: false)
             a.makeSplit(left, with: right)
@@ -82,7 +92,8 @@ import Testing
     }
 
     @Test func aTileGroupIsNeverInTwoWindows() {
-        windows { a, b in
+        windows { a, b, _ in
+            let space = a.currentSpaceID
             let pages = (0..<3).map { _ in a.newTab(url: nil, spaceID: space, select: false) }
             a.makeGroup(pages, shape: TileShape(regions: [.left, .topRight, .bottomRight]))
             let shape = a.split(for: pages[0])
@@ -94,7 +105,8 @@ import Testing
     }
 
     @Test func theTabsUnderAMovedTabStayAndMoveUp() {
-        windows { a, b in
+        windows { a, b, _ in
+            let space = a.currentSpaceID
             let parent = a.newTab(url: nil, spaceID: space, select: false)
             let tab = a.newTab(url: nil, spaceID: space, select: false)
             let child = a.newTab(url: nil, spaceID: space, select: false)
@@ -108,7 +120,8 @@ import Testing
     }
 
     @Test func aPinnedPagesTabDoesNotMove() {
-        windows { a, b in
+        windows { a, b, _ in
+            let space = a.currentSpaceID
             let tab = a.newTab(url: nil, spaceID: space, select: false)
             tab.bookmarkID = UUID()
             #expect(b.take(tab, from: a, at: 0).isEmpty)
@@ -118,9 +131,10 @@ import Testing
     }
 
     @Test func aWindowWithNoTabsLeftIsEmptyThoughPinnedPagesAreOpen() {
-        windows { a, b in
+        windows { a, b, library in
+            let space = a.currentSpaceID
             let tab = a.newTab(url: nil, spaceID: space)
-            let pinned = Tab(url: URL(string: "https://example.com/pinned"), spaceID: space)
+            let pinned = Tab(url: URL(string: "https://example.com/pinned"), spaceID: space, library: library, profiles: a.profiles)
             a.adoptBookmarkTab(pinned, bookmarkID: UUID())
             #expect(a.hasTabs)
             b.take(tab, from: a, at: 0)
@@ -131,8 +145,8 @@ import Testing
     }
 
     @Test func aTabInAnotherSpaceCountsToo() {
-        windows { a, _ in
-            guard let other = Library.shared.spaces.dropFirst().first?.id else { return }
+        windows { a, _, library in
+            let other = library.addSpace(name: "Work").id
             #expect(!a.hasTabs)
             a.newTab(url: nil, spaceID: other, select: false)
             #expect(a.hasTabs)

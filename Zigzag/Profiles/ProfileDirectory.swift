@@ -186,6 +186,22 @@ nonisolated struct ProfileDirectory: Codable, Equatable {
         var seen: Set<UUID> = []
         return stores.filter { !known.contains($0) && seen.insert($0).inserted }
     }
+
+    static func load(in root: URL = Paths.support) -> (directory: ProfileDirectory, wasSetAside: Bool) {
+        switch JSONStore.loadOutcome(ProfileDirectory.self, from: Paths.profiles(in: root)) {
+        case .loaded(let directory, _):
+            return (directory, false)
+        case .missing:
+            return (ProfileDirectory(), false)
+        case .unreadable:
+            return (ProfileDirectory(), true)
+        }
+    }
+
+    @discardableResult
+    func save(in root: URL = Paths.support) -> Bool {
+        JSONStore.save(self, to: Paths.profiles(in: root))
+    }
 }
 
 /// The choices a profile makes for itself that are kept in the preferences, each under a name of its own. The first

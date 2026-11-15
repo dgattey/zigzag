@@ -50,6 +50,8 @@ final class Tab: NSObject {
     }
 
     let id: UUID
+    let library: Library
+    let profiles: Profiles
     /// The space it's in. Changed only through `setSpace`, the one place that can see a tab change profile.
     private(set) var spaceID: UUID
     /// Set when this tab is the live page behind a bookmark. Such tabs live in the bookmark row, not the tab list.
@@ -157,7 +159,7 @@ final class Tab: NSObject {
     /// changed space. A private tab's page is in its window's own store, whatever the space.
     func settleProfile() {
         // A private page stays in its window's store; what it's offered (saved logins) is still its space's profile's.
-        guard !isPrivate else { profile = Profiles.shared.profile(forSpace: spaceID); return }
+        guard !isPrivate else { profile = profiles.profile(forSpace: spaceID); return }
         let wanted = homeProfile
         if wanted !== profile { rehome(to: wanted) }
     }
@@ -165,8 +167,8 @@ final class Tab: NSObject {
     /// The profile its page belongs in: its space's, or for a favorite, the profile the favorite is kept in,
     /// whichever of that profile's spaces it was last opened from.
     var homeProfile: Profile {
-        let favorite = isFavorite ? bookmarkID.flatMap { Library.shared.isFavorite($0) ? $0 : nil } : nil
-        return Profiles.shared.profile(Library.shared.directory.profileID(ofPageIn: spaceID, favorite: favorite))
+        let favorite = isFavorite ? bookmarkID.flatMap { library.isFavorite($0) ? $0 : nil } : nil
+        return profiles.profile(library.directory.profileID(ofPageIn: spaceID, favorite: favorite))
     }
 
     /// Rebuilds the page in another profile: that profile's sign-ins and extensions, the same back and forward
@@ -284,15 +286,19 @@ final class Tab: NSObject {
     private var observingAudio = false
 
     init(id: UUID = UUID(), url: URL?, title: String? = nil, spaceID: UUID, configuration: WKWebViewConfiguration? = nil,
-         interactionState: Data? = nil, lastActivated: Date = Date(), createdAt: Date = Date()) {
+         interactionState: Data? = nil, lastActivated: Date = Date(), createdAt: Date = Date(),
+         library: Library = .shared, profiles: Profiles? = nil) {
+        let resolvedProfiles = profiles ?? (library === Library.shared ? .shared : Profiles(library: library))
         self.id = id
+        self.library = library
+        self.profiles = resolvedProfiles
         // A web view WebKit made for a page's new window shows no address until its first page arrives: the page
         // that opened it can write into it while a load that never finishes would name another site over it.
         self.url = configuration == nil ? url : nil
         self.title = title ?? (SettingsPage.isSettings(self.url) ? String(localized: "Settings", comment: "The name of the tab showing Zigzag's Settings.") : self.url?.host() ?? String(localized: "New Tab", comment: "The name of a tab with no page yet."))
         self.spaceID = spaceID
         // A page WebKit made for another page's new window is in that page's profile, whatever space it lands in.
-        self.profile = configuration.flatMap { Profiles.shared.profile(ofStore: $0.websiteDataStore) } ?? Profiles.shared.profile(forSpace: spaceID)
+        self.profile = configuration.flatMap { resolvedProfiles.profile(ofStore: $0.websiteDataStore) } ?? resolvedProfiles.profile(forSpace: spaceID)
         self.pendingConfiguration = configuration
         self.pendingInteractionState = interactionState
         self.lastActivated = lastActivated
@@ -438,7 +444,7 @@ final class Tab: NSObject {
     /// Looks again at which chosen icon shows: after its own changes, it becomes or stops being a pinned page's or a
     /// favorite's, or the library changes (that page given an icon, or ⌘Z taking one back).
     func refreshChosenIcon() {
-        let icon = Self.chosenIcon(own: customIcon, bookmarkID: bookmarkID) { Library.shared.bookmark($0) }
+        let icon = Self.chosenIcon(own: customIcon, bookmarkID: bookmarkID) { library.bookmark($0) }
         guard icon != chosenIcon else { return }
         chosenIcon = icon
         changed.send(.favicon)
@@ -836,7 +842,7 @@ final class Tab: NSObject {
 
     /// The profile a page is in: its tab's, or for a page that isn't a tab's (a pop-up window), the one it was made in.
     private static func profile(of webView: WKWebView) -> Profile {
-        Profiles.shared.profile(ofPage: webView)
+        ((webView as? BrowserWebView)?.owner?.profiles ?? Profiles.shared).profile(ofPage: webView)
     }
 
     /// Starts this tab with another tab's back/forward list, then navigates: used for search folding.
@@ -2075,7 +2081,7 @@ extension Tab {
             return
         }
         // Website Data is part of Privacy until there's a second profile.
-        let pane = SettingsPage.pane(for: url).shown(manyProfiles: Library.shared.hasManyProfiles)
+        let pane = SettingsPage.pane(for: url).shown(manyProfiles: library.hasManyProfiles)
         if let settingsView {
             if settingsView.pane != pane { settingsView.show(pane) }
             return

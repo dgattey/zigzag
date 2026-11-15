@@ -81,19 +81,25 @@ final class TabManager {
         var isCollapsed = false
     }
 
+    let library: Library
+    let profiles: Profiles
     /// Private windows share one throwaway store between their tabs, gone when the window closes.
     let privateStore: WKWebsiteDataStore?
     var isPrivate: Bool { privateStore != nil }
 
-    init(spaceID: UUID? = nil, isPrivate: Bool = false) {
+    init(spaceID: UUID? = nil, isPrivate: Bool = false, library: Library = .shared, profiles: Profiles? = nil) {
+        let resolvedProfiles = profiles ?? (library === Library.shared ? .shared : Profiles(library: library))
+        self.library = library
+        self.profiles = resolvedProfiles
         privateStore = isPrivate ? .nonPersistent() : nil
-        let requested = spaceID.flatMap { Library.shared.space($0)?.id }
-        currentSpaceID = requested ?? Library.shared.spaces[0].id
-        libraryToken = Library.shared.changed.observe { [weak self] in
+        let requested = spaceID.flatMap { library.space($0)?.id }
+        currentSpaceID = requested ?? library.spaces[0].id
+        libraryToken = library.changed.observe { [weak self] in
+            guard let self else { return }
             // Favorites and pinned pages count among the navigable tabs.
-            self?.extensionPlaces.removeAll()
-            self?.libraryDidChange()
-            Brand.libraryChanged()
+            self.extensionPlaces.removeAll()
+            self.libraryDidChange()
+            if self.library === Library.shared { Brand.libraryChanged() }
         }
         suspendTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.sleepIdleTabs() }
@@ -103,6 +109,8 @@ final class TabManager {
     }
 
     func invalidate() {
+        libraryToken = nil
+        placesToken = nil
         suspendTimer?.invalidate()
         allTabs.forEach { $0.close(keepingSnapshot: !isPrivate) }
         tabsBySpace = [:]
@@ -112,19 +120,19 @@ final class TabManager {
     // MARK: Reading
 
     /// The profile of the space you're in.
-    var profile: Profile { Profiles.shared.profile(forSpace: currentSpaceID) }
+    var profile: Profile { profiles.profile(forSpace: currentSpaceID) }
 
     /// A space on this profile for something that belongs there (a page one of its extensions opens): the one
     /// you're in if it's on that profile, else one with tabs in this window, else the profile's first.
     func space(for profile: Profile) -> UUID? {
         if self.profile === profile { return currentSpaceID }
-        let spaces = Library.shared.spaces(in: profile.id).map(\.id)
+        let spaces = library.spaces(in: profile.id).map(\.id)
         return spaces.first { !tabs(in: $0).isEmpty } ?? spaces.first
     }
     /// That profile's extensions; none in a private window, where extensions don't run.
     @available(macOS 15.4, *)
     var extensionHost: ExtensionHost? { isPrivate ? nil : profile.extensions }
-    var currentSpace: SpaceInfo { Library.shared.space(currentSpaceID) ?? Library.shared.spaces[0] }
+    var currentSpace: SpaceInfo { library.space(currentSpaceID) ?? library.spaces[0] }
     var currentTabs: [Tab] { tabs(in: currentSpaceID) }
     func tabs(in spaceID: UUID) -> [Tab] { tabsBySpace[spaceID] ?? [] }
 
@@ -255,9 +263,9 @@ final class TabManager {
         // A page another page opened stays with it: WebKit made it in that page's profile.
         // One WebKit made for a page with no tab of its own here (a Zigzag Mini's, a sign-in window's) goes to a
         // space on that page's profile, not to whichever space this window happens to show.
-        let made = configuration.flatMap { Profiles.shared.profile(ofStore: $0.websiteDataStore) }
+        let made = configuration.flatMap { profiles.profile(ofStore: $0.websiteDataStore) }
         let space = spaceID ?? (configuration != nil ? opener?.spaceID : nil) ?? made.flatMap { self.space(for: $0) } ?? currentSpaceID
-        let tab = Tab(url: url, title: title, spaceID: space, configuration: configuration)
+        let tab = Tab(url: url, title: title, spaceID: space, configuration: configuration, library: library, profiles: profiles)
         // Whoever gave the address loads it: a page's link in a new tab is the page's doing, a typed one yours.
         tab.firstLoadSender = sender
         tab.host = host
@@ -330,7 +338,7 @@ final class TabManager {
     /// is still as it was), and shows.
     func putBack(_ tab: Tab, at place: Place) {
         guard !tab.isClosed, self.tab(with: tab.id) == nil else { return }
-        let space = Library.shared.space(place.spaceID) != nil ? place.spaceID : currentSpaceID
+        let space = library.space(place.spaceID) != nil ? place.spaceID : currentSpaceID
         tab.host = host
         tab.setSpace(space)
         watch(tab)
@@ -426,7 +434,7 @@ final class TabManager {
 
     func restoreSelection(_ selection: [UUID: UUID], currentSpaceID: UUID) {
         selectedBySpace = selection
-        if Library.shared.space(currentSpaceID) != nil { self.currentSpaceID = currentSpaceID }
+        if library.space(currentSpaceID) != nil { self.currentSpaceID = currentSpaceID }
         if let tab = selectedTab { promote(tab) }
         changed.send(.structure)
         changed.send(.space)
@@ -445,7 +453,7 @@ final class TabManager {
             let home = tab.homeProfile
             if profile === home {
                 tab.setSpace(currentSpaceID)
-            } else if Profiles.shared.profile(forSpace: tab.spaceID) !== home, let space = space(for: home) {
+            } else if profiles.profile(forSpace: tab.spaceID) !== home, let space = space(for: home) {
                 tab.setSpace(space)
             }
         }
@@ -497,8 +505,8 @@ final class TabManager {
 
     /// Favorites, bookmarks, then tabs, in sidebar order: what Cmd+Option+Up/Down walk.
     var navigableTabs: [Tab] {
-        let favoriteLive = Library.shared.favorites(in: profile.id).compactMap { bookmarkTabs[$0.id] }
-        let bookmarkLive = Library.shared.bookmarks(in: currentSpaceID).compactMap { bookmarkTabs[$0.id] }
+        let favoriteLive = library.favorites(in: profile.id).compactMap { bookmarkTabs[$0.id] }
+        let bookmarkLive = library.bookmarks(in: currentSpaceID).compactMap { bookmarkTabs[$0.id] }
         return favoriteLive + bookmarkLive + currentTabs
     }
 
@@ -539,7 +547,7 @@ final class TabManager {
             if pair.isGroup { leaveGroup(tab, notify: false) } else { unsplit(tab, notify: false) }
         }
         if let bookmarkID = tab.bookmarkID {
-            Library.shared.makeFavorite(bookmarkID, at: index, in: profile.id)
+            library.makeFavorite(bookmarkID, at: index, in: profile.id)
             tab.isFavorite = true
             return
         }
@@ -549,16 +557,16 @@ final class TabManager {
         tab.isFavorite = true
         tab.settleLandingIfLoading()
         bookmarkTabs[id] = tab
-        Library.shared.addFavorite(url: url, title: Self.bookmarkTitle(tab.displayTitle, url: url), icon: tab.customIcon, at: index, id: id, in: profile.id)
+        library.addFavorite(url: url, title: Self.bookmarkTitle(tab.displayTitle, url: url), icon: tab.customIcon, at: index, id: id, in: profile.id)
     }
 
     /// A pinned page into the favorites at a tile's place, open or not; open, a split it's in comes along.
     func favoriteBookmark(_ bookmarkID: UUID, at index: Int?) {
-        if let tab = bookmarkTabs[bookmarkID] { favoriteTab(tab, at: index) } else { Library.shared.makeFavorite(bookmarkID, at: index, in: profile.id) }
+        if let tab = bookmarkTabs[bookmarkID] { favoriteTab(tab, at: index) } else { library.makeFavorite(bookmarkID, at: index, in: profile.id) }
     }
 
     /// Where a page is, or, for a pinned page not loaded yet, where it's pinned to.
-    private func address(of tab: Tab) -> URL? { tab.url ?? tab.bookmarkID.flatMap { Library.shared.bookmark($0)?.url } }
+    private func address(of tab: Tab) -> URL? { tab.url ?? tab.bookmarkID.flatMap { library.bookmark($0)?.url } }
 
     /// A bookmark's page, made (not yet shown) if it isn't open.
     func pageTab(for bookmark: Bookmark) -> Tab { liveTab(for: bookmark) }
@@ -567,10 +575,10 @@ final class TabManager {
     /// was, and open together.
     func joinFavorite(_ tab: Tab, onto favoriteID: UUID, onRight: Bool) {
         // A pinned page that isn't loaded has no address of its own yet: its pinned one stands in.
-        guard let url = address(of: tab), Library.shared.isFavorite(favoriteID),
+        guard let url = address(of: tab), library.isFavorite(favoriteID),
               Self.canSplit(splitSide(of: tab), onto: splitSide(ofBookmark: favoriteID)) else { return }
         let mark: Bookmark
-        if let id = tab.bookmarkID, let pinned = Library.shared.detachBookmark(id) {
+        if let id = tab.bookmarkID, let pinned = library.detachBookmark(id) {
             mark = pinned
         } else {
             removeFromList(tab)
@@ -580,7 +588,7 @@ final class TabManager {
             bookmarkTabs[mark.id] = tab
         }
         tab.isFavorite = true
-        Library.shared.joinFavorite(mark, onto: favoriteID, onRight: onRight)
+        library.joinFavorite(mark, onto: favoriteID, onRight: onRight)
         openBookmark(mark)
     }
 
@@ -591,11 +599,11 @@ final class TabManager {
         guard pages.count == pair.count, pages.allSatisfy({ address(of: $0) != nil }) else { return false }
         // Already a pinned split or group: it moves up as it is.
         let pinned = pages.compactMap(\.bookmarkID)
-        if pinned.count == pages.count, let split = Library.shared.pinnedSplit(containing: pinned[0]), Set(split.ids) == Set(pinned) {
-            if Library.shared.isFavorite(split.left) {
-                if let index { Library.shared.moveFavorite(split.left, to: index) }
+        if pinned.count == pages.count, let split = library.pinnedSplit(containing: pinned[0]), Set(split.ids) == Set(pinned) {
+            if library.isFavorite(split.left) {
+                if let index { library.moveFavorite(split.left, to: index) }
             } else {
-                Library.shared.makeFavorite(split.left, at: index, in: profile.id)
+                library.makeFavorite(split.left, at: index, in: profile.id)
             }
             pages.forEach { $0.isFavorite = true }
             return true
@@ -603,7 +611,7 @@ final class TabManager {
         var marks: [Bookmark] = []
         for page in pages {
             let url = address(of: page)!
-            if let id = page.bookmarkID, let mark = Library.shared.detachBookmark(id) ?? Library.shared.bookmark(id) {
+            if let id = page.bookmarkID, let mark = library.detachBookmark(id) ?? library.bookmark(id) {
                 marks.append(mark)
             } else {
                 removeFromList(page)
@@ -616,7 +624,7 @@ final class TabManager {
             page.isFavorite = true
         }
         if let layout = PinnedSplit(marks.map(\.id), as: pair) {
-            Library.shared.addFavoriteSplit(marks, as: layout, at: index, in: profile.id)
+            library.addFavoriteSplit(marks, as: layout, at: index, in: profile.id)
         }
         changed.send(.structure)
         return true
@@ -626,7 +634,7 @@ final class TabManager {
 
     func switchToSpace(_ id: UUID) {
         // A private window keeps to one space: a swipe or ⌃1 there would leave its tabs out of sight.
-        guard !isPrivate, id != currentSpaceID, Library.shared.space(id) != nil else { return }
+        guard !isPrivate, id != currentSpaceID, library.space(id) != nil else { return }
         // Making a space switches to it on its own; going somewhere after that is the guide's last step.
         if !isPrivate, Tutorial.done.contains("space") { Tutorial.complete("switch") }
         let left = selectedTab
@@ -777,13 +785,13 @@ final class TabManager {
 
     /// Shows another space's list without leaving the page you're on (used while dragging a tab).
     func showSpaceKeepingPage(_ id: UUID) {
-        guard !isPrivate, id != currentSpaceID, Library.shared.space(id) != nil else { return }
+        guard !isPrivate, id != currentSpaceID, library.space(id) != nil else { return }
         currentSpaceID = id
         changed.send(.space)
     }
 
     func switchSpace(by offset: Int) {
-        let spaces = Library.shared.spaces
+        let spaces = library.spaces
         guard let index = spaces.firstIndex(where: { $0.id == currentSpaceID }) else { return }
         let next = index + offset
         guard spaces.indices.contains(next) else { return }
@@ -791,14 +799,14 @@ final class TabManager {
     }
 
     private func libraryDidChange() {
-        let spaceIDs = Set(Library.shared.spaces.map(\.id))
+        let spaceIDs = Set(library.spaces.map(\.id))
         // A removed space takes its tabs with it.
         for (id, tabs) in tabsBySpace where !spaceIDs.contains(id) {
             tabs.forEach { $0.close(); forget($0) }
             tabsBySpace[id] = nil
         }
         // A removed bookmark keeps its page around as a normal tab, so nothing disappears unexpectedly.
-        let bookmarkIDs = Library.shared.allBookmarkIDs
+        let bookmarkIDs = library.allBookmarkIDs
         for (id, tab) in bookmarkTabs where !bookmarkIDs.contains(id) {
             bookmarkTabs[id] = nil
             tab.bookmarkID = nil
@@ -813,8 +821,8 @@ final class TabManager {
         // Bookmarks moved to another space carry their live tab; one that became, or stopped being, a favorite
         // (undo, another window) says so, as does one given an icon.
         for (id, tab) in bookmarkTabs {
-            if let space = Library.shared.spaceID(ofBookmark: id) { tab.setSpace(space) }
-            tab.isFavorite = Library.shared.isFavorite(id)
+            if let space = library.spaceID(ofBookmark: id) { tab.setSpace(space) }
+            tab.isFavorite = library.isFavorite(id)
             tab.refreshChosenIcon()
         }
         // Pinned pages stop being a pinned split (separated, one made a favorite, undo, another window): the split on
@@ -827,15 +835,15 @@ final class TabManager {
             return !canSplit(left, with: right) || left.spaceID != right.spaceID
         }
         if !spaceIDs.contains(currentSpaceID) {
-            currentSpaceID = Library.shared.spaces[0].id
+            currentSpaceID = library.spaces[0].id
             changed.send(.space)
             changed.send(.selection)
         }
         // A space put on another profile takes its open pages there. Not a favorite that was open in it: that
         // stays its own profile's, in another of that profile's spaces, and the space shows a page of its own.
         var reselected = false
-        for tab in bookmarkTabs.values where tab.isFavorite && Profiles.shared.profile(forSpace: tab.spaceID) !== tab.homeProfile {
-            for (space, id) in selectedBySpace where id == tab.id && Profiles.shared.profile(forSpace: space) !== tab.homeProfile {
+        for tab in bookmarkTabs.values where tab.isFavorite && profiles.profile(forSpace: tab.spaceID) !== tab.homeProfile {
+            for (space, id) in selectedBySpace where id == tab.id && profiles.profile(forSpace: space) !== tab.homeProfile {
                 selectedBySpace[space] = tabs(in: space).first?.id
                 reselected = reselected || space == currentSpaceID
             }
@@ -853,8 +861,8 @@ final class TabManager {
     /// rest of it, side by side again as it was laid out.
     func openBookmark(_ bookmark: Bookmark) {
         let tab = liveTab(for: bookmark)
-        if let pinned = Library.shared.pinnedSplit(containing: bookmark.id), split(for: tab)?.count != pinned.ids.count {
-            let marks = pinned.ids.compactMap { Library.shared.bookmark($0) }
+        if let pinned = library.pinnedSplit(containing: bookmark.id), split(for: tab)?.count != pinned.ids.count {
+            let marks = pinned.ids.compactMap { library.bookmark($0) }
             if marks.count == pinned.ids.count {
                 let pages = marks.map { liveTab(for: $0) }
                 pages.forEach { unsplit($0, notify: false) }
@@ -871,9 +879,9 @@ final class TabManager {
     /// A bookmark's live tab, made (not yet shown) if it isn't open.
     private func liveTab(for bookmark: Bookmark) -> Tab {
         if let tab = bookmarkTabs[bookmark.id] { return tab }
-        let spaceID = Library.shared.spaceID(ofBookmark: bookmark.id) ?? currentSpaceID
-        let tab = Tab(url: bookmark.url, title: bookmark.title, spaceID: spaceID)
-        tab.isFavorite = Library.shared.isFavorite(bookmark.id)
+        let spaceID = library.spaceID(ofBookmark: bookmark.id) ?? currentSpaceID
+        let tab = Tab(url: bookmark.url, title: bookmark.title, spaceID: spaceID, library: library, profiles: profiles)
+        tab.isFavorite = library.isFavorite(bookmark.id)
         tab.host = host
         watch(tab)
         tab.bookmarkID = bookmark.id
@@ -883,7 +891,7 @@ final class TabManager {
         // page starts (1Password's) otherwise hears "Tab not found".
         if #available(macOS 15.4, *) { ExtensionCenter.tabOpened(tab) }
         // Opened again after its folder was shut over it: it shows under the folder now, as a page opened there does.
-        Library.shared.untuck(bookmark.id)
+        library.untuck(bookmark.id)
         changed.send(.structure)
         return tab
     }
@@ -906,9 +914,9 @@ final class TabManager {
                 return mark
             }
             if let layout = PinnedSplit(marks.map(\.id), as: pair) {
-                Library.shared.addPinnedSplit(marks, as: layout, to: space, at: index)
+                library.addPinnedSplit(marks, as: layout, to: space, at: index)
             } else {
-                marks.forEach { Library.shared.addBookmark(url: $0.url, title: $0.title, icon: $0.icon, to: space, at: index, id: $0.id) }
+                marks.forEach { library.addBookmark(url: $0.url, title: $0.title, icon: $0.icon, to: space, at: index, id: $0.id) }
             }
             return
         }
@@ -921,13 +929,13 @@ final class TabManager {
         tab.settleLandingIfLoading()
         tab.setSpace(space)
         bookmarkTabs[bookmarkID] = tab
-        Library.shared.addBookmark(url: url, title: Self.bookmarkTitle(tab.displayTitle, url: url), icon: tab.customIcon, to: space, at: index, id: bookmarkID)
+        library.addBookmark(url: url, title: Self.bookmarkTitle(tab.displayTitle, url: url), icon: tab.customIcon, to: space, at: index, id: bookmarkID)
     }
 
     /// A tab dropped on a pinned page: it's pinned beside it as a pinned split, where the page is and in its folder.
     /// The page keeps its pin as it is, and the two open side by side.
     func pinSplit(_ tab: Tab, with bookmarkID: UUID, tabOnRight: Bool) {
-        guard let url = tab.url, let space = Library.shared.spaceID(ofBookmark: bookmarkID),
+        guard let url = tab.url, let space = library.spaceID(ofBookmark: bookmarkID),
               Self.canSplit(splitSide(of: tab), onto: splitSide(ofBookmark: bookmarkID)) else { return }
         let mark = Bookmark(url: url, title: Self.bookmarkTitle(tab.displayTitle, url: url), icon: tab.customIcon)
         removeFromList(tab)
@@ -935,17 +943,17 @@ final class TabManager {
         tab.settleLandingIfLoading()
         tab.setSpace(space)
         bookmarkTabs[mark.id] = tab
-        Library.shared.pinBeside(mark, bookmarkID, onRight: tabOnRight)
+        library.pinBeside(mark, bookmarkID, onRight: tabOnRight)
         openBookmark(mark)
     }
 
     /// A pinned page dropped on another in the same space: the two become one pinned split where the other is, in its
     /// folder, and open side by side.
     func joinPinned(_ bookmarkID: UUID, onto targetID: UUID, onRight: Bool) {
-        guard let space = Library.shared.spaceID(ofBookmark: targetID), Library.shared.spaceID(ofBookmark: bookmarkID) == space,
+        guard let space = library.spaceID(ofBookmark: targetID), library.spaceID(ofBookmark: bookmarkID) == space,
               Self.canSplit(splitSide(ofBookmark: bookmarkID), onto: splitSide(ofBookmark: targetID)) else { return }
-        Library.shared.joinPinned(bookmarkID, beside: targetID, onRight: onRight)
-        if let page = Library.shared.bookmark(bookmarkID) { openBookmark(page) }
+        library.joinPinned(bookmarkID, beside: targetID, onRight: onRight)
+        if let page = library.bookmark(bookmarkID) { openBookmark(page) }
     }
 
     /// Turns a bookmark's live tab back into a normal tab, removing the bookmark. Returns the tab now in the list:
@@ -954,16 +962,16 @@ final class TabManager {
     /// `parent`: the tab it goes under, where that keeps the groups whole (a drop among nested tabs).
     @discardableResult
     func unbookmark(_ bookmarkID: UUID, toIndex index: Int? = nil, in spaceID: UUID? = nil, under parent: UUID? = nil) -> Tab? {
-        let isFavorite = Library.shared.isFavorite(bookmarkID)
-        let space = (isFavorite ? spaceID : nil) ?? Library.shared.spaceID(ofBookmark: bookmarkID) ?? currentSpaceID
-        if let pinned = Library.shared.pinnedSplit(containing: bookmarkID) { return unpin(pinned, returning: bookmarkID, toIndex: index, in: space) }
+        let isFavorite = library.isFavorite(bookmarkID)
+        let space = (isFavorite ? spaceID : nil) ?? library.spaceID(ofBookmark: bookmarkID) ?? currentSpaceID
+        if let pinned = library.pinnedSplit(containing: bookmarkID) { return unpin(pinned, returning: bookmarkID, toIndex: index, in: space) }
         if isFavorite {
             bookmarkTabs[bookmarkID]?.setSpace(space)
             bookmarkTabs[bookmarkID]?.isFavorite = false
         }
         var result: Tab?
         // Back among the tabs, it keeps the icon it had pinned.
-        let icon = Library.shared.bookmark(bookmarkID)?.icon
+        let icon = library.bookmark(bookmarkID)?.icon
         if let tab = bookmarkTabs[bookmarkID] {
             bookmarkTabs[bookmarkID] = nil
             tab.customIcon = icon
@@ -972,8 +980,8 @@ final class TabManager {
             tab.parentID = TabTree.parent(at: at, preferring: parent, in: treeNodes(in: tab.spaceID))
             tabsBySpace[tab.spaceID, default: []].insert(tab, at: at)
             result = tab
-        } else if let bookmark = Library.shared.bookmark(bookmarkID), let index {
-            let tab = Tab(url: bookmark.url, title: bookmark.title, spaceID: space)
+        } else if let bookmark = library.bookmark(bookmarkID), let index {
+            let tab = Tab(url: bookmark.url, title: bookmark.title, spaceID: space, library: library, profiles: profiles)
             tab.customIcon = icon
             tab.host = host
             watch(tab)
@@ -983,7 +991,7 @@ final class TabManager {
             tabsBySpace[tab.spaceID, default: []].insert(tab, at: at)
             result = tab
         }
-        Library.shared.removeBookmark(bookmarkID)
+        library.removeBookmark(bookmarkID)
         return result
     }
 
@@ -993,7 +1001,7 @@ final class TabManager {
         let anyOpen = pinned.ids.contains { bookmarkTabs[$0] != nil }
         var halves: [(id: UUID, tab: Tab)] = []
         for id in pinned.ids {
-            let icon = Library.shared.bookmark(id)?.icon
+            let icon = library.bookmark(id)?.icon
             if let tab = bookmarkTabs[id] {
                 bookmarkTabs[id] = nil
                 tab.customIcon = icon
@@ -1002,8 +1010,8 @@ final class TabManager {
                 tab.isFavorite = false
                 tab.setSpace(space)
                 halves.append((id, tab))
-            } else if anyOpen || index != nil, let bookmark = Library.shared.bookmark(id) {
-                let tab = Tab(url: bookmark.url, title: bookmark.title, spaceID: space)
+            } else if anyOpen || index != nil, let bookmark = library.bookmark(id) {
+                let tab = Tab(url: bookmark.url, title: bookmark.title, spaceID: space, library: library, profiles: profiles)
                 tab.customIcon = icon
                 tab.host = host
                 watch(tab)
@@ -1018,7 +1026,7 @@ final class TabManager {
             halves.forEach { unsplit($0.tab, notify: false) }
             splits.append(pair)
         }
-        Library.shared.removeBookmarks(pinned.ids)
+        library.removeBookmarks(pinned.ids)
         // A pinned split that was on screen stays there, now as tabs.
         if halves.contains(where: { $0.tab === selectedTab }) { changed.send(.selection) }
         return halves.first { $0.id == bookmarkID }?.tab
@@ -1026,7 +1034,7 @@ final class TabManager {
 
     /// True when a pinned tab has moved on from its pinned page.
     func isAway(_ bookmarkID: UUID) -> Bool {
-        guard let tab = bookmarkTabs[bookmarkID], let url = tab.url, let bookmark = Library.shared.bookmark(bookmarkID) else { return false }
+        guard let tab = bookmarkTabs[bookmarkID], let url = tab.url, let bookmark = library.bookmark(bookmarkID) else { return false }
         let here = TabManager.normalize(url)
         return here != TabManager.normalize(bookmark.url) && here != tab.pinnedLanding.map(TabManager.normalize)
     }
@@ -1048,7 +1056,7 @@ final class TabManager {
 
     /// Sends a bookmark's page back to the bookmarked address.
     func resetBookmarkTab(_ bookmarkID: UUID) {
-        guard let tab = bookmarkTabs[bookmarkID], let bookmark = Library.shared.bookmark(bookmarkID) else { return }
+        guard let tab = bookmarkTabs[bookmarkID], let bookmark = library.bookmark(bookmarkID) else { return }
         // Already where it lands on its own: nothing to go back to.
         if let landing = tab.pinnedLanding, let url = tab.url, TabManager.normalize(url) == TabManager.normalize(landing) { return }
         tab.landingUntil = Date().addingTimeInterval(8)
@@ -1199,9 +1207,9 @@ final class TabManager {
         let found: Int? = id.map { id in closedTabs.lastIndex { $0.id == id } } ?? (closedTabs.isEmpty ? nil : closedTabs.count - 1)
         guard let index = found else { return nil }
         let closed = closedTabs.remove(at: index)
-        let space = Library.shared.space(closed.spaceID) != nil ? closed.spaceID : currentSpaceID
+        let space = library.space(closed.spaceID) != nil ? closed.spaceID : currentSpaceID
         let tab = Tab(url: closed.url, title: closed.title, spaceID: space, interactionState: closed.interactionState,
-                      lastActivated: closed.lastActivated)
+                      lastActivated: closed.lastActivated, library: library, profiles: profiles)
         closed.apply(to: tab)
         tab.host = host
         watch(tab)
@@ -1330,7 +1338,7 @@ final class TabManager {
         let wasSelected = panes(of: tab).contains { selectedTab === $0 }
         let oldIndex = tabs(in: tab.spaceID).firstIndex { $0 === tab } ?? 0
         move(tab, to: index, in: spaceID)
-        if wasSelected { selectAfterClosing(Tab(url: nil, spaceID: currentSpaceID), index: oldIndex) }
+        if wasSelected { selectAfterClosing(Tab(url: nil, spaceID: currentSpaceID, library: library, profiles: profiles), index: oldIndex) }
     }
 
     // MARK: Duplicates
@@ -1501,7 +1509,7 @@ final class TabManager {
         guard let first = pages.first else { return false }
         if pages.allSatisfy({ $0.bookmarkID == nil }) { return pages.allSatisfy { $0.spaceID == first.spaceID } }
         let marks = pages.compactMap(\.bookmarkID)
-        guard marks.count == pages.count, let pinned = Library.shared.pinnedSplit(containing: marks[0]) else { return false }
+        guard marks.count == pages.count, let pinned = library.pinnedSplit(containing: marks[0]) else { return false }
         return Set(pinned.ids) == Set(marks) && pinned.ids.count == marks.count
     }
 
@@ -1512,9 +1520,9 @@ final class TabManager {
         guard tab !== other else { return false }
         switch (tab.bookmarkID, other.bookmarkID) {
         case (nil, nil): return true
-        case let (a?, b?): return Library.shared.pinnedSplit(containing: a)?.contains(b) == true
+        case let (a?, b?): return library.pinnedSplit(containing: a)?.contains(b) == true
         case let (pinned?, nil), let (nil, pinned?):
-            return !Library.shared.isFavorite(pinned) && Library.shared.pinnedSplit(containing: pinned) == nil
+            return !library.isFavorite(pinned) && library.pinnedSplit(containing: pinned) == nil
         }
     }
 
@@ -1545,8 +1553,8 @@ final class TabManager {
 
     func splitSide(ofBookmark id: UUID) -> SplitSide {
         let open = bookmarkTabs[id].map { split(for: $0) != nil } ?? false
-        return SplitSide(kind: Library.shared.isFavorite(id) ? .favorite : .pinned,
-                         inSplit: open || Library.shared.pinnedSplit(containing: id) != nil)
+        return SplitSide(kind: library.isFavorite(id) ? .favorite : .pinned,
+                         inSplit: open || library.pinnedSplit(containing: id) != nil)
     }
 
     /// Puts `other` beside `tab` (on the right or left, or below or above, stacked), ending any splits either was in.
@@ -1641,7 +1649,7 @@ final class TabManager {
     private func rememberPinnedLayout(_ pair: SplitPair) {
         let marks = pair.ids.compactMap { tab(with: $0)?.bookmarkID }
         guard marks.count == pair.count, let layout = PinnedSplit(marks, as: pair) else { return }
-        Library.shared.setPinnedSplitLayout(layout)
+        library.setPinnedSplitLayout(layout)
     }
 
     /// Puts back a split exactly as it was (undo).
@@ -1727,7 +1735,7 @@ final class TabManager {
         for (id, tab) in alive {
             tab.setSpace(target.spaces[id] ?? tab.spaceID)
             tab.bookmarkID = target.pinned.first { $0.value == id }?.key
-            tab.isFavorite = tab.bookmarkID.map(Library.shared.isFavorite) ?? false
+            tab.isFavorite = tab.bookmarkID.map(library.isFavorite) ?? false
             tab.parentID = tab.bookmarkID == nil ? target.parents[id] : nil
         }
         for space in Array(tabsBySpace.keys) { repairTree(in: space) }
