@@ -248,7 +248,7 @@ final class SidebarListView: NSView {
             result += bookmarks.filter { $0.id == current || isOpen($0.id) }.map { .bookmark($0.id) }
         } else {
             let pinned = Self.pinnedRows(bookmarks: bookmarks.map(\.id).filter { !riders.contains($0) }, folders: folders,
-                                         current: current, isOpen: isOpen)
+                                         ui: Library.shared.sidebarUI, current: current, isOpen: isOpen)
             result += pinned.rows
             rowDepth = pinned.depth
             folderPageCounts = pinned.pageCounts
@@ -305,7 +305,7 @@ final class SidebarListView: NSView {
     /// folder hides all that's inside it but the page you're on and its pages opened since it was shut (#94): the ones
     /// open when you shut it, it hides too (#154). An empty folder sits at the top of where it is, where you'll see it
     /// and can drop pages in. `bookmarks` leaves out the pages that ride in another's row.
-    static func pinnedRows(bookmarks: [UUID], folders: [BookmarkFolder], current: UUID?,
+    static func pinnedRows(bookmarks: [UUID], folders: [BookmarkFolder], ui: SidebarUIState, current: UUID?,
                            isOpen: (UUID) -> Bool) -> (rows: [SidebarItem], depth: [SidebarItem: Int], pageCounts: [UUID: Int]) {
         var result: [SidebarItem] = []
         var rowDepth: [SidebarItem: Int] = [:]
@@ -329,11 +329,14 @@ final class SidebarListView: NSView {
             while let id = next, seen.insert(id).inserted { folderPageCounts[id, default: 0] += folder.bookmarkIDs.count; next = byID[id]?.parentID }
         }
         var stack: [UUID] = []
-        var firstShut: Int? { stack.firstIndex { byID[$0]?.isOpen == false } }
+        var firstShut: Int? { stack.firstIndex { !ui.isFolderOpen($0) } }
         // Worked out once for the whole tree, not again for each folder: an imported one can have hundreds.
         let holding = folders.holdingPages
         let inside = Dictionary(grouping: folders, by: \.parentID)
-        let tucked = Dictionary(folders.compactMap { f in f.tucked.map { (f.id, Set($0)) } }, uniquingKeysWith: { a, _ in a })
+        let tucked = Dictionary(folders.compactMap { folder -> (UUID, Set<UUID>)? in
+            let set = ui.tuckedBookmarks(in: folder.id)
+            return set.isEmpty ? nil : (folder.id, set)
+        }, uniquingKeysWith: { a, _ in a })
         func enter(_ id: UUID) {
             if firstShut == nil { result.append(.folder(id)); rowDepth[.folder(id)] = stack.count }
             stack.append(id)
@@ -345,7 +348,7 @@ final class SidebarListView: NSView {
             while !stack.isEmpty, stack.count > chain.count || Array(chain.prefix(stack.count)) != stack { stack.removeLast() }
             for folder in chain.dropFirst(stack.count) { enter(folder) }
             if let shut = firstShut {
-                let hiddenOnPurpose = stack[shut...].contains { byID[$0]?.isOpen == false && tucked[$0]?.contains(id) == true }
+                let hiddenOnPurpose = stack[shut...].contains { !ui.isFolderOpen($0) && tucked[$0]?.contains(id) == true }
                 guard id == current || (isOpen(id) && !hiddenOnPurpose) else { continue }
                 result.append(.bookmark(id)); rowDepth[.bookmark(id)] = shut + 1
             } else {
@@ -727,7 +730,7 @@ final class SidebarListView: NSView {
             default: return nil
             }
         }
-        if case .folder(let id)? = before, Library.shared.folder(id)?.isOpen == true { return id }
+        if case .folder(let id)? = before, Library.shared.folder(id) != nil, Library.shared.isFolderOpen(id) { return id }
         let below = folder(of: after)
         // After a folder's last row, how far in the pointer is picks how many folders out it lands, never further out
         // than the row below it.
@@ -850,8 +853,8 @@ final class SidebarListView: NSView {
         case .folder(let id):
             let row = FolderRowView()
             row.onClick = { [weak self] _ in
-                guard let open = Library.shared.folder(id)?.isOpen else { return }
-                self?.delegate?.listSetFolderOpen(id, !open)
+                guard Library.shared.folder(id) != nil else { return }
+                self?.delegate?.listSetFolderOpen(id, !Library.shared.isFolderOpen(id))
             }
             row.onRename = { [weak self] name in self?.delegate?.listRenameFolder(id, to: name) }
             row.onRightClick = { [weak self] _ in self?.delegate?.listMenu(for: item) }
@@ -1028,7 +1031,7 @@ final class SidebarListView: NSView {
         case .folder(let id):
             guard let row = view as? FolderRowView, let folder = Library.shared.folder(id) else { return }
             let count = folderPageCounts[id] ?? Library.shared.allBookmarkIDs(inFolder: id).count
-            row.configure(name: folder.name, open: folder.isOpen, count: count, icon: folder.icon)
+            row.configure(name: folder.name, open: Library.shared.isFolderOpen(id), count: count, icon: folder.icon)
             row.setAccessibilityDisclosureLevel(rowDepth[item] ?? 0)
         case .bookmark(let id):
             guard let row = view as? TabRowView, let bookmark = Library.shared.bookmark(id) else { return }
@@ -1537,8 +1540,8 @@ final class SidebarListView: NSView {
                 let ids = Library.shared.pinnedSplit(containing: id).map(\.ids) ?? [id]
                 return ids.compactMap { at[$0] }.max().map { $0 + 1 } ?? 0
             case .folder(let id):
-                guard let folder = byID[id], let places = span[id] else { return 0 }
-                return folder.isOpen ? places.lowerBound : places.upperBound + 1
+                guard byID[id] != nil, let places = span[id] else { return 0 }
+                return Library.shared.isFolderOpen(id) ? places.lowerBound : places.upperBound + 1
             default:
                 return 0
             }

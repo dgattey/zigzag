@@ -173,6 +173,28 @@ struct ProfileDirectoryTests {
         let json = #"{"others":[{"id":"\#(Profile.defaultID.uuidString)","name":"Twice"}]}"#
         #expect(try JSONDecoder().decode(ProfileDirectory.self, from: Data(json.utf8)).all.count == 1)
     }
+
+    @Test func loadsAndSavesInAnIsolatedRoot() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("zigzag-profiles-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let empty = ProfileDirectory.load(in: root)
+        #expect(empty.directory == ProfileDirectory() && !empty.wasSetAside)
+
+        var directory = ProfileDirectory()
+        let workProfile = directory.add(name: "Work", color: .sage, created: Date(timeIntervalSince1970: 1_800_000_000))
+        directory.assign(space: work, to: workProfile.id)
+        #expect(directory.save(in: root))
+
+        let reloaded = ProfileDirectory.load(in: root)
+        #expect(reloaded.directory == directory && !reloaded.wasSetAside)
+
+        try Data("not-json".utf8).write(to: Paths.profiles(in: root), options: .atomic)
+        let damaged = ProfileDirectory.load(in: root)
+        #expect(damaged.directory == ProfileDirectory() && damaged.wasSetAside)
+        #expect(!FileManager.default.fileExists(atPath: Paths.profiles(in: root).path))
+    }
 }
 
 /// What a profile chooses for itself in the preferences, and when Zigzag's own passwords step aside for a
@@ -277,15 +299,38 @@ struct PageProfileTests {
 /// first; a profile that isn't chosen falls back to the first as before.
 @MainActor
 struct ListedProfileTests {
+    private func isolated(_ body: (Library, Profiles) throws -> Void) rethrows {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("zigzag-listed-profiles-\(UUID().uuidString)", isDirectory: true)
+        let library = Library(root: root)
+        let profiles = Profiles(library: library)
+        defer {
+            library.saveNow()
+            try? FileManager.default.removeItem(at: root)
+        }
+        try body(library, profiles)
+    }
+
     @Test func aGoneProfileIsNotListedAndCantBeHeld() {
-        let gone = UUID()
-        #expect(Profiles.shared.listed(gone) == nil)
-        #expect(Profiles.shared.profile(gone) === Profiles.shared.default)
-        #expect(!Profiles.shared.hold(gone))
-        #expect(!Profiles.shared.inUse.contains(gone))
+        isolated { library, profiles in
+            let gone = UUID()
+            #expect(profiles.listed(gone) == nil)
+            #expect(profiles.profile(gone) === profiles.default)
+            #expect(!profiles.hold(gone))
+            #expect(!profiles.inUse.contains(gone))
+
+            let added = library.addProfile(name: "Work")
+            #expect(profiles.listed(added.id)?.folder == Profiles.folder(of: added.id, in: library.root))
+            #expect(profiles.hold(added.id))
+            #expect(profiles.inUse.contains(added.id))
+            profiles.done(added.id)
+            #expect(!profiles.inUse.contains(added.id))
+        }
     }
 
     @Test func theFirstProfileIsAlwaysListed() {
-        #expect(Profiles.shared.listed(Profile.defaultID) === Profiles.shared.default)
+        isolated { library, profiles in
+            #expect(profiles.listed(Profile.defaultID) === profiles.default)
+            #expect(profiles.default.folder == library.root)
+        }
     }
 }

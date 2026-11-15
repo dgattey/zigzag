@@ -351,7 +351,7 @@ struct DarkPagesTests {
             DarkPages.setSiteChoice(.on, for: tab.url)
             #expect(webView.appearance?.name == .darkAqua)
             DarkPages.setSiteChoice(.automatic, for: tab.url)
-            #expect(webView.appearance?.name == .aqua)
+            #expect(webView.appearance?.name == (DarkPages.systemIsDark ? .darkAqua : .aqua))
         }
     }
 }

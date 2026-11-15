@@ -68,7 +68,7 @@ private final class UpdaterDelegate: NSObject, SPUUpdaterDelegate {
 /// are kept. Logins, cookies and passwords live with macOS and WebKit, outside any update's reach, so they're not
 /// part of it.
 nonisolated enum UpdateBackup {
-    private static let files = ["Library.json", "Profiles.json", "Session.json", "Downloads.json", "History.sqlite", "History.sqlite-wal", "History.sqlite-shm"]
+    private static let files = ["Library.json", "Profiles.json", "SidebarUIState.json", "Session.json", "Downloads.json", "History.sqlite", "History.sqlite-wal", "History.sqlite-shm"]
     /// Left as it is when a backup from before there were profiles is put back: without it every space would land
     /// on the first profile, away from the sign-ins and extensions it had.
     private static let keptWhenNotInBackup: Set<String> = ["Profiles.json"]

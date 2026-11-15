@@ -38,7 +38,12 @@ struct ShipFixesTests {
     @Test func unknownSpaceColourStillReads() throws {
         let json = Data(#"["sky", "ultraviolet", "mint"]"#.utf8)
         let colours = try JSONDecoder().decode([SpaceColor].self, from: json)
-        #expect(colours == [.sky, .graphite, .mint])
+        #expect(colours[0] == .sky)
+        #expect(!colours[1].isKnown && colours[1].rawValue == "ultraviolet")
+        #expect(colours[1].background == SpaceColor.graphite.background)
+        #expect(colours[2] == .mint)
+        let reencoded = try JSONDecoder().decode([String].self, from: JSONEncoder().encode(colours))
+        #expect(reencoded == ["sky", "ultraviolet", "mint"])
     }
 
     @Test func aPageInFullScreenKeepsTheSizeWebKitGaveIt() {

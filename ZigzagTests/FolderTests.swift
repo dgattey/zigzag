@@ -303,8 +303,8 @@ struct ArcFolderTests {
 struct ShutFolderRowsTests {
     let p = (0..<4).map { _ in UUID() }
 
-    private func rows(_ folders: [BookmarkFolder], current: UUID? = nil, open: Set<UUID> = []) -> [SidebarItem] {
-        SidebarListView.pinnedRows(bookmarks: p, folders: folders, current: current, isOpen: open.contains).rows
+    private func rows(_ folders: [BookmarkFolder], ui: SidebarUIState = .init(), current: UUID? = nil, open: Set<UUID> = []) -> [SidebarItem] {
+        SidebarListView.pinnedRows(bookmarks: p, folders: folders, ui: ui, current: current, isOpen: open.contains).rows
     }
 
     @Test func anOpenFolderShowsAllItHolds() {
@@ -314,32 +314,33 @@ struct ShutFolderRowsTests {
 
     @Test func shuttingHidesThePagesOpenThen() {
         // Both pages open when it's shut: shut, it shows neither.
-        var folder = BookmarkFolder(name: "F", bookmarkIDs: [p[0], p[1]])
-        folder.isOpen = false
-        folder.tucked = [p[0], p[1]]
-        #expect(rows([folder], open: [p[0], p[1]]) == [.folder(folder.id), .bookmark(p[2]), .bookmark(p[3])])
+        let folder = BookmarkFolder(name: "F", bookmarkIDs: [p[0], p[1]])
+        var ui = SidebarUIState()
+        ui.setFolderOpen(folder.id, false, tucking: [p[0], p[1]])
+        #expect(rows([folder], ui: ui, open: [p[0], p[1]]) == [.folder(folder.id), .bookmark(p[2]), .bookmark(p[3])])
     }
 
     @Test func thePageYouAreOnStillShows() {
-        var folder = BookmarkFolder(name: "F", bookmarkIDs: [p[0], p[1]])
-        folder.isOpen = false
-        folder.tucked = [p[0], p[1]]
-        let shown = SidebarListView.pinnedRows(bookmarks: p, folders: [folder], current: p[1], isOpen: { _ in true })
+        let folder = BookmarkFolder(name: "F", bookmarkIDs: [p[0], p[1]])
+        var ui = SidebarUIState()
+        ui.setFolderOpen(folder.id, false, tucking: [p[0], p[1]])
+        let shown = SidebarListView.pinnedRows(bookmarks: p, folders: [folder], ui: ui, current: p[1], isOpen: { _ in true })
         #expect(shown.rows == [.folder(folder.id), .bookmark(p[1]), .bookmark(p[2]), .bookmark(p[3])])
         #expect(shown.depth[.bookmark(p[1])] == 1)
     }
 
     @Test func aPageOpenedSinceItWasShutShows() {
         // p[1] wasn't open when the folder was shut; opened since, it shows under it, set in.
-        var folder = BookmarkFolder(name: "F", bookmarkIDs: [p[0], p[1]])
-        folder.isOpen = false
-        folder.tucked = [p[0]]
-        let shown = SidebarListView.pinnedRows(bookmarks: p, folders: [folder], current: nil, isOpen: Set([p[0], p[1]]).contains)
+        let folder = BookmarkFolder(name: "F", bookmarkIDs: [p[0], p[1]])
+        var ui = SidebarUIState()
+        ui.setFolderOpen(folder.id, false, tucking: [p[0]])
+        let shown = SidebarListView.pinnedRows(bookmarks: p, folders: [folder], ui: ui, current: nil, isOpen: Set([p[0], p[1]]).contains)
         #expect(shown.rows == [.folder(folder.id), .bookmark(p[1]), .bookmark(p[2]), .bookmark(p[3])])
         #expect(shown.depth[.bookmark(p[1])] == 1)
         // A folder from before #154 (nothing tucked) still shows its open pages, as #94 has it.
-        folder.tucked = nil
-        #expect(rows([folder], open: [p[0]]) == [.folder(folder.id), .bookmark(p[0]), .bookmark(p[2]), .bookmark(p[3])])
+        var untucked = SidebarUIState()
+        untucked.setFolderOpen(folder.id, false)
+        #expect(rows([folder], ui: untucked, open: [p[0]]) == [.folder(folder.id), .bookmark(p[0]), .bookmark(p[2]), .bookmark(p[3])])
     }
 
     @Test func aShutFolderInsideHidesWhatItTucked() {
@@ -347,17 +348,19 @@ struct ShutFolderRowsTests {
         let outer = BookmarkFolder(name: "Outer", bookmarkIDs: [p[0]])
         var inner = BookmarkFolder(name: "Inner", bookmarkIDs: [p[1]])
         inner.parentID = outer.id
-        inner.isOpen = false
-        inner.tucked = [p[1]]
-        let shown = rows([outer, inner], open: [p[1]])
+        var ui = SidebarUIState()
+        ui.setFolderOpen(inner.id, false, tucking: [p[1]])
+        let shown = rows([outer, inner], ui: ui, open: [p[1]])
         #expect(!shown.contains(.bookmark(p[1])))
         #expect(shown.contains(.folder(inner.id)) && shown.contains(.bookmark(p[0])))
     }
 
     @Test func aLibraryFromBeforeTuckingOpens() throws {
-        var json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(BookmarkFolder(name: "F", isOpen: false))) as! [String: Any]
-        json.removeValue(forKey: "tucked")
-        let decoded = try JSONDecoder().decode(BookmarkFolder.self, from: JSONSerialization.data(withJSONObject: json))
-        #expect(decoded.name == "F" && !decoded.isOpen && decoded.tucked == nil)
+        let folderID = UUID()
+        let data = Data("""
+        {"searchEngine":"google","spaces":[{"id":"\(UUID().uuidString)","name":"Home","color":"sky","bookmarks":[],"folders":[{"id":"\(folderID.uuidString)","name":"F","bookmarkIDs":[],"isOpen":false}]}]}
+        """.utf8)
+        let migrated = SidebarUIState.migratedFromLegacyLibraryJSON(data)
+        #expect(migrated.hadLegacyKeys && !migrated.state.isFolderOpen(folderID) && migrated.state.tuckedBookmarks(in: folderID).isEmpty)
     }
 }

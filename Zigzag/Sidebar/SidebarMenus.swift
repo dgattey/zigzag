@@ -295,7 +295,8 @@ enum SidebarMenus {
         menu.autoenablesItems = false
         menu.addItem(Item(String(localized: "Rename", comment: "Item in a folder's context menu in the sidebar.")) { controller.sidebar.list.renameFolder(folder.id) })
         menu.addItem(Item(changeIconTitle) { controller.chooseFolderIcon(folder.id) })
-        menu.addItem(Item(folder.isOpen ? String(localized: "Close Folder", comment: "Item in a folder's context menu in the sidebar.") : String(localized: "Open Folder", comment: "Item in a folder's context menu in the sidebar.")) { controller.listSetFolderOpen(folder.id, !folder.isOpen) })
+        let isOpen = Library.shared.isFolderOpen(folder.id)
+        menu.addItem(Item(isOpen ? String(localized: "Close Folder", comment: "Item in a folder's context menu in the sidebar.") : String(localized: "Open Folder", comment: "Item in a folder's context menu in the sidebar.")) { controller.listSetFolderOpen(folder.id, !isOpen) })
         menu.addItem(Item(String(localized: "New Folder Inside", comment: "Item in a folder's context menu in the sidebar.")) { controller.newFolder(inside: folder.id) })
         // Out of the folder it's in, to the level above.
         if let parent = folder.parentID {

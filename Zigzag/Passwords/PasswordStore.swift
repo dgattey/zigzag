@@ -1,5 +1,6 @@
 import AppKit
 import LocalAuthentication
+import os
 import Security
 
 /// Where a password belongs: the exact scheme, host and port it was saved on. Autofill only ever offers a
@@ -77,10 +78,307 @@ nonisolated struct Credential: Identifiable, Hashable, Sendable {
     }
 }
 
+nonisolated protocol PasswordVault: Sendable {
+    var isEphemeral: Bool { get }
+    var canFallbackOnMissingEntitlement: Bool { get }
+    mutating func loadCredentials() throws -> [Credential]
+    mutating func loadPassword(for id: UUID) throws -> SecretString
+    mutating func insert(_ credential: Credential, password: SecretString) throws
+    mutating func update(_ credential: Credential, password: SecretString?) throws
+    mutating func delete(_ id: UUID) throws
+    mutating func containsNeverSave(_ origin: Origin) throws -> Bool
+    mutating func setNeverSave(_ never: Bool, on origin: Origin) throws
+    mutating func loadNeverSaveSites() throws -> [Origin]
+    mutating func deleteAll() throws
+}
+
+nonisolated struct MemoryPasswordVault: PasswordVault {
+    var isEphemeral: Bool { true }
+    var canFallbackOnMissingEntitlement: Bool { false }
+    private var entries: [UUID: (credential: Credential, password: SecretString)] = [:]
+    private var neverSave: Set<Origin> = []
+
+    mutating func loadCredentials() throws -> [Credential] {
+        entries.values.map(\.credential).sorted { $0.modified > $1.modified }
+    }
+
+    mutating func loadPassword(for id: UUID) throws -> SecretString {
+        guard let entry = entries[id] else { throw PasswordStore.Failure.notFound }
+        return entry.password
+    }
+
+    mutating func insert(_ credential: Credential, password: SecretString) throws {
+        entries[credential.id] = (credential, password)
+    }
+
+    mutating func update(_ credential: Credential, password: SecretString?) throws {
+        guard let entry = entries[credential.id] else { throw PasswordStore.Failure.notFound }
+        entries[credential.id] = (credential, password ?? entry.password)
+    }
+
+    mutating func delete(_ id: UUID) throws {
+        entries[id] = nil
+    }
+
+    mutating func containsNeverSave(_ origin: Origin) throws -> Bool {
+        neverSave.contains(origin)
+    }
+
+    mutating func setNeverSave(_ never: Bool, on origin: Origin) throws {
+        if never { neverSave.insert(origin) } else { neverSave.remove(origin) }
+    }
+
+    mutating func loadNeverSaveSites() throws -> [Origin] {
+        neverSave.sorted { $0.description < $1.description }
+    }
+
+    mutating func deleteAll() throws {
+        entries.removeAll()
+        neverSave.removeAll()
+    }
+}
+
+nonisolated struct KeychainOps: Sendable {
+    var copyMatching: @Sendable (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
+    var add: @Sendable (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
+    var update: @Sendable (CFDictionary, CFDictionary) -> OSStatus
+    var delete: @Sendable (CFDictionary) -> OSStatus
+
+    static let system = KeychainOps(
+        copyMatching: { SecItemCopyMatching($0, $1) },
+        add: { SecItemAdd($0, $1) },
+        update: { SecItemUpdate($0, $1) },
+        delete: { SecItemDelete($0) }
+    )
+
+    static func always(_ status: OSStatus) -> KeychainOps {
+        KeychainOps(
+            copyMatching: { _, _ in status },
+            add: { _, _ in status },
+            update: { _, _ in status },
+            delete: { _ in status }
+        )
+    }
+}
+
+nonisolated struct KeychainPasswordVault: PasswordVault {
+    /// "Never save for this site" choices, kept with the passwords so they sync too.
+    private static let neverService = "app.zigzag.never-save"
+
+    var isEphemeral: Bool { false }
+    var canFallbackOnMissingEntitlement: Bool { !hasSucceeded }
+    /// Tests use their own label so they never see or touch the person's passwords.
+    let label: String
+    let synchronizable: Bool
+    let accessGroup: String
+    let ops: KeychainOps
+    private(set) var hasSucceeded = false
+
+    init(label: String, synchronizable: Bool, accessGroup: String = PasswordStore.accessGroup, ops: KeychainOps = .system) {
+        self.label = label
+        self.synchronizable = synchronizable
+        self.accessGroup = accessGroup
+        self.ops = ops
+    }
+
+    mutating func loadCredentials() throws -> [Credential] {
+        var query = baseQuery()
+        query[kSecMatchLimit] = kSecMatchLimitAll
+        query[kSecReturnAttributes] = true
+        var result: CFTypeRef?
+        let status = ops.copyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound {
+            hasSucceeded = true
+            return []
+        }
+        guard status == errSecSuccess, let items = result as? [[CFString: Any]] else {
+            throw PasswordStore.Failure.keychain(status)
+        }
+        hasSucceeded = true
+        return items.compactMap(Self.credential(from:)).sorted { $0.modified > $1.modified }
+    }
+
+    mutating func loadPassword(for id: UUID) throws -> SecretString {
+        var query = itemQuery(for: id)
+        query[kSecReturnData] = true
+        var result: CFTypeRef?
+        let status = ops.copyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound {
+            hasSucceeded = true
+            throw PasswordStore.Failure.notFound
+        }
+        guard status == errSecSuccess, let data = result as? Data else {
+            throw PasswordStore.Failure.keychain(status)
+        }
+        hasSucceeded = true
+        return SecretString(data: data)
+    }
+
+    mutating func insert(_ credential: Credential, password: SecretString) throws {
+        var item = attributes(for: credential)
+        item[kSecValueData] = password.data
+        let status = ops.add(item as CFDictionary, nil)
+        guard status == errSecSuccess else { throw PasswordStore.Failure.keychain(status) }
+        hasSucceeded = true
+    }
+
+    mutating func update(_ credential: Credential, password: SecretString?) throws {
+        var changes = attributes(for: credential)
+        for key in [kSecClass, kSecUseDataProtectionKeychain, kSecAttrAccessGroup, kSecAttrSynchronizable] { changes[key] = nil }
+        if let password { changes[kSecValueData] = password.data }
+        let status = ops.update(itemQuery(for: credential.id) as CFDictionary, changes as CFDictionary)
+        guard status == errSecSuccess else { throw PasswordStore.Failure.keychain(status) }
+        hasSucceeded = true
+    }
+
+    mutating func delete(_ id: UUID) throws {
+        let status = ops.delete(itemQuery(for: id) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw PasswordStore.Failure.keychain(status)
+        }
+        hasSucceeded = true
+    }
+
+    mutating func containsNeverSave(_ origin: Origin) throws -> Bool {
+        var query = neverQuery(origin)
+        query[kSecMatchLimit] = kSecMatchLimitOne
+        let status = ops.copyMatching(query as CFDictionary, nil)
+        if status == errSecMissingEntitlement { throw PasswordStore.Failure.keychain(status) }
+        if status == errSecSuccess || status == errSecItemNotFound { hasSucceeded = true }
+        return status == errSecSuccess
+    }
+
+    mutating func setNeverSave(_ never: Bool, on origin: Origin) throws {
+        let query = neverQuery(origin)
+        let deleted = ops.delete(query as CFDictionary)
+        if deleted == errSecMissingEntitlement { throw PasswordStore.Failure.keychain(deleted) }
+        if deleted == errSecSuccess || deleted == errSecItemNotFound { hasSucceeded = true }
+        guard never else { return }
+        var item = query
+        item[kSecAttrSynchronizable] = synchronizable
+        item[kSecAttrAccessible] = kSecAttrAccessibleWhenUnlocked
+        item[kSecValueData] = Data()
+        let added = ops.add(item as CFDictionary, nil)
+        if added == errSecMissingEntitlement { throw PasswordStore.Failure.keychain(added) }
+        if added == errSecSuccess { hasSucceeded = true }
+    }
+
+    mutating func loadNeverSaveSites() throws -> [Origin] {
+        var query: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: Self.neverService + "." + label,
+                                      kSecUseDataProtectionKeychain: true, kSecAttrAccessGroup: accessGroup,
+                                      kSecAttrSynchronizable: kSecAttrSynchronizableAny]
+        query[kSecMatchLimit] = kSecMatchLimitAll
+        query[kSecReturnAttributes] = true
+        var result: CFTypeRef?
+        let status = ops.copyMatching(query as CFDictionary, &result)
+        if status == errSecMissingEntitlement { throw PasswordStore.Failure.keychain(status) }
+        if status == errSecItemNotFound {
+            hasSucceeded = true
+            return []
+        }
+        guard status == errSecSuccess, let items = result as? [[CFString: Any]] else { return [] }
+        hasSucceeded = true
+        return items.compactMap { ($0[kSecAttrAccount] as? String).flatMap { Origin(URL(string: $0)) } }
+    }
+
+    mutating func deleteAll() throws {
+        var query = baseQuery()
+        query[kSecMatchLimit] = nil
+        let credentialsStatus = ops.delete(query as CFDictionary)
+        if credentialsStatus == errSecMissingEntitlement { throw PasswordStore.Failure.keychain(credentialsStatus) }
+        if credentialsStatus == errSecSuccess || credentialsStatus == errSecItemNotFound { hasSucceeded = true }
+        let never: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: Self.neverService + "." + label,
+                                      kSecUseDataProtectionKeychain: true, kSecAttrAccessGroup: accessGroup,
+                                      kSecAttrSynchronizable: kSecAttrSynchronizableAny]
+        let neverStatus = ops.delete(never as CFDictionary)
+        if neverStatus == errSecMissingEntitlement { throw PasswordStore.Failure.keychain(neverStatus) }
+        if neverStatus == errSecSuccess || neverStatus == errSecItemNotFound { hasSucceeded = true }
+    }
+
+    // MARK: Keychain plumbing
+
+    private func baseQuery() -> [CFString: Any] {
+        [kSecClass: kSecClassInternetPassword,
+         kSecUseDataProtectionKeychain: true,
+         kSecAttrAccessGroup: accessGroup,
+         kSecAttrLabel: label,
+         kSecAttrSynchronizable: kSecAttrSynchronizableAny]
+    }
+
+    private func neverQuery(_ origin: Origin) -> [CFString: Any] {
+        [kSecClass: kSecClassGenericPassword,
+         kSecAttrService: Self.neverService + "." + label,
+         kSecAttrAccount: origin.description,
+         kSecUseDataProtectionKeychain: true,
+         kSecAttrAccessGroup: accessGroup,
+         kSecAttrSynchronizable: kSecAttrSynchronizableAny]
+    }
+
+    private func itemQuery(for id: UUID) -> [CFString: Any] {
+        // The ID lives in the item's comment, so one item can be found without reading any password.
+        var query = baseQuery()
+        query[kSecAttrComment] = id.uuidString
+        return query
+    }
+
+    private struct Details: Codable {
+        var title: String
+        var notes: String
+        var otpAuth: String
+        var created: Date
+        var modified: Date
+        var lastUsed: Date?
+        // Only on a strong password the site hasn't taken yet; older items have neither.
+        var pendingGenerated: Bool?
+        var generatedFor: String?
+    }
+
+    private func attributes(for credential: Credential) -> [CFString: Any] {
+        let details = Details(title: credential.title, notes: credential.notes, otpAuth: credential.otpAuth,
+                              created: credential.created, modified: credential.modified, lastUsed: credential.lastUsed,
+                              pendingGenerated: credential.isPendingGenerated ? true : nil,
+                              generatedFor: credential.isPendingGenerated && !credential.generatedFor.isEmpty ? credential.generatedFor : nil)
+        var item: [CFString: Any] = [
+            kSecClass: kSecClassInternetPassword,
+            kSecUseDataProtectionKeychain: true,
+            kSecAttrAccessGroup: accessGroup,
+            kSecAttrSynchronizable: synchronizable,
+            // Readable while the Mac is unlocked; required for sync, and never needs Touch ID to fill.
+            kSecAttrAccessible: kSecAttrAccessibleWhenUnlocked,
+            kSecAttrLabel: label,
+            kSecAttrComment: credential.id.uuidString,
+            kSecAttrServer: credential.origin.host,
+            kSecAttrProtocol: credential.origin.scheme == "http" ? kSecAttrProtocolHTTP : kSecAttrProtocolHTTPS,
+            kSecAttrAccount: credential.username,
+            // Title, notes and dates, as JSON; internet-password items have no generic attribute.
+            kSecAttrDescription: (try? JSONEncoder().encode(details)).flatMap { String(data: $0, encoding: .utf8) } ?? "",
+        ]
+        if let port = credential.origin.port { item[kSecAttrPort] = port }
+        return item
+    }
+
+    private static func credential(from item: [CFString: Any]) -> Credential? {
+        guard let comment = item[kSecAttrComment] as? String, let id = UUID(uuidString: comment),
+              let host = item[kSecAttrServer] as? String else { return nil }
+        let scheme = (item[kSecAttrProtocol] as? String) == (kSecAttrProtocolHTTP as String) ? "http" : "https"
+        let port = (item[kSecAttrPort] as? Int).flatMap { $0 == 0 ? nil : $0 }
+        let details = (item[kSecAttrDescription] as? String).flatMap { try? JSONDecoder().decode(Details.self, from: Data($0.utf8)) }
+        let origin = Origin(scheme: scheme, host: host, port: port)
+        return Credential(id: id, origin: origin, username: item[kSecAttrAccount] as? String ?? "",
+                          title: details?.title ?? origin.displayName, notes: details?.notes ?? "", otpAuth: details?.otpAuth ?? "",
+                          created: details?.created ?? (item[kSecAttrCreationDate] as? Date ?? Date()),
+                          modified: details?.modified ?? (item[kSecAttrModificationDate] as? Date ?? Date()),
+                          lastUsed: details?.lastUsed, isPendingGenerated: details?.pendingGenerated ?? false,
+                          generatedFor: details?.generatedFor ?? "")
+    }
+}
+
 /// The only code that touches saved passwords. Each login is an internet-password item in Zigzag's own
 /// group of the data protection keychain, synced through iCloud Keychain unless the person turns that off.
 /// Listing reads only the details (site, username, dates); the password is read one at a time, on demand.
 actor PasswordStore {
+    private static let log = Logger(subsystem: "wang.zigao.zigzag", category: "passwords")
+
     static let shared: PasswordStore = {
         #if DEBUG
         // A debug copy started with its own label keeps a vault of its own, never syncing, so its Passwords window
@@ -104,23 +402,26 @@ actor PasswordStore {
     nonisolated static var isTestVault: Bool { testVaultLabel != nil }
 
     /// The entitlement's group, as the build signed it (the team's prefix comes first); Zigzag's own as a fallback.
-    static let accessGroup: String = {
+    nonisolated static let accessGroup: String = {
         let group = Bundle.main.object(forInfoDictionaryKey: "ZigzagKeychainGroup") as? String ?? ""
         return group.hasSuffix(".app.zigzag.passwords") ? group : "432GL3WKY2.app.zigzag.passwords"
     }()
-    /// "Never save for this site" choices, kept with the passwords so they sync too.
-    private static let neverService = "app.zigzag.never-save"
 
-    /// Tests use their own label so they never see or touch the person's passwords.
-    private let label: String
-    private let synchronizable: Bool
+    private var vault: any PasswordVault
+    var isEphemeral: Bool { vault.isEphemeral }
+
+    init(vault: any PasswordVault) {
+        self.vault = vault
+    }
 
     init(label: String = "Zigzag", synchronizable: Bool = UserDefaults.standard.object(forKey: "PasswordsSyncWithICloud") as? Bool ?? true) {
-        self.label = label
-        self.synchronizable = synchronizable
         #if DEBUG
-        if label == Self.memoryLabel { memory = [:] }
+        if label == Self.memoryLabel {
+            self.vault = MemoryPasswordVault()
+            return
+        }
         #endif
+        self.vault = KeychainPasswordVault(label: label, synchronizable: synchronizable)
     }
 
     #if DEBUG
@@ -128,29 +429,28 @@ actor PasswordStore {
     /// reach the keychain (an ad-hoc signed one) to show its Passwords window with test logins. It never reads or
     /// writes the keychain, and it's gone when the app quits.
     private static let memoryLabel = "Zigzag Test memory"
-    private var memory: [UUID: (credential: Credential, password: SecretString)]?
     #endif
 
-    enum Failure: Error { case keychain(OSStatus), notFound }
+    nonisolated enum Failure: Error, Equatable, Sendable { case keychain(OSStatus), notFound }
 
     /// Fires on the main thread when saved passwords change.
     nonisolated static let didChange = Notification.Name("ZigzagPasswordsDidChange")
+
+    private func withVault<T>(_ operation: (inout any PasswordVault) throws -> T) throws -> T {
+        do {
+            return try operation(&vault)
+        } catch Failure.keychain(errSecMissingEntitlement) where vault.canFallbackOnMissingEntitlement {
+            Self.log.error("Keychain entitlement missing (-34018); falling back to ephemeral in-memory vault for this run.")
+            vault = MemoryPasswordVault()
+            return try operation(&vault)
+        }
+    }
 
     // MARK: Reading
 
     /// Every saved login's details, newest first. No passwords.
     func all() throws -> [Credential] {
-        #if DEBUG
-        if let memory { return memory.values.map(\.credential).sorted { $0.modified > $1.modified } }
-        #endif
-        var query = baseQuery()
-        query[kSecMatchLimit] = kSecMatchLimitAll
-        query[kSecReturnAttributes] = true
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status == errSecItemNotFound { return [] }
-        guard status == errSecSuccess, let items = result as? [[CFString: Any]] else { throw Failure.keychain(status) }
-        return items.compactMap(Self.credential(from:)).sorted { $0.modified > $1.modified }
+        try withVault { try $0.loadCredentials() }
     }
 
     /// Logins saved for exactly this origin.
@@ -160,15 +460,7 @@ actor PasswordStore {
 
     /// The password of one login.
     func password(for id: UUID) throws -> SecretString {
-        #if DEBUG
-        if let memory { guard let entry = memory[id] else { throw Failure.notFound }; return entry.password }
-        #endif
-        var query = try itemQuery(for: id)
-        query[kSecReturnData] = true
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else { throw status == errSecItemNotFound ? Failure.notFound : Failure.keychain(status) }
-        return SecretString(data: data)
+        try withVault { try $0.loadPassword(for: id) }
     }
 
     // MARK: Writing
@@ -203,32 +495,14 @@ actor PasswordStore {
         let credential = Credential(id: UUID(), origin: origin, username: username, title: title ?? origin.displayName,
                                     notes: notes, otpAuth: otpAuth, created: created, modified: Date(), lastUsed: nil,
                                     isPendingGenerated: generatedFor != nil, generatedFor: generatedFor ?? "")
-        #if DEBUG
-        if memory != nil { memory?[credential.id] = (credential, password); notify(); return credential }
-        #endif
-        var item = attributes(for: credential)
-        item[kSecValueData] = password.data
-        let status = SecItemAdd(item as CFDictionary, nil)
-        guard status == errSecSuccess else { throw Failure.keychain(status) }
+        try withVault { try $0.insert(credential, password: password) }
         notify()
         return credential
     }
 
     /// Changes a login's details, and its password when one is given.
     func update(_ credential: Credential, password: SecretString? = nil) throws {
-        #if DEBUG
-        if let memory {
-            guard let entry = memory[credential.id] else { throw Failure.notFound }
-            self.memory?[credential.id] = (credential, password ?? entry.password)
-            notify()
-            return
-        }
-        #endif
-        var changes = attributes(for: credential)
-        for key in [kSecClass, kSecUseDataProtectionKeychain, kSecAttrAccessGroup, kSecAttrSynchronizable] { changes[key] = nil }
-        if let password { changes[kSecValueData] = password.data }
-        let status = SecItemUpdate(try itemQuery(for: credential.id) as CFDictionary, changes as CFDictionary)
-        guard status == errSecSuccess else { throw Failure.keychain(status) }
+        try withVault { try $0.update(credential, password: password) }
         notify()
     }
 
@@ -239,26 +513,13 @@ actor PasswordStore {
                      created: Date, modified: Date) throws -> Credential {
         let credential = Credential(id: UUID(), origin: origin, username: username, title: origin.displayName,
                                     notes: notes, otpAuth: otpAuth, created: created, modified: modified, lastUsed: nil)
-        #if DEBUG
-        if memory != nil { memory?[credential.id] = (credential, password); return credential }
-        #endif
-        var item = attributes(for: credential)
-        item[kSecValueData] = password.data
-        let status = SecItemAdd(item as CFDictionary, nil)
-        guard status == errSecSuccess else { throw Failure.keychain(status) }
+        try withVault { try $0.insert(credential, password: password) }
         return credential
     }
 
     /// Replaces an imported login's password, quietly, for the same reason.
     func replaceImported(_ credential: Credential, password: SecretString) throws {
-        #if DEBUG
-        if memory != nil { memory?[credential.id] = (credential, password); return }
-        #endif
-        var changes = attributes(for: credential)
-        for key in [kSecClass, kSecUseDataProtectionKeychain, kSecAttrAccessGroup, kSecAttrSynchronizable] { changes[key] = nil }
-        changes[kSecValueData] = password.data
-        let status = SecItemUpdate(try itemQuery(for: credential.id) as CFDictionary, changes as CFDictionary)
-        guard status == errSecSuccess else { throw Failure.keychain(status) }
+        try withVault { try $0.update(credential, password: password) }
     }
 
     /// Tells everyone listening that passwords changed, once, after a batch.
@@ -271,142 +532,27 @@ actor PasswordStore {
     }
 
     func delete(_ id: UUID) throws {
-        #if DEBUG
-        if memory != nil { memory?[id] = nil; notify(); return }
-        #endif
-        let status = SecItemDelete(try itemQuery(for: id) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else { throw Failure.keychain(status) }
+        try withVault { try $0.delete(id) }
         notify()
     }
 
     // MARK: Never for this site
 
     func neverSaves(on origin: Origin) -> Bool {
-        #if DEBUG
-        if memory != nil { return false }
-        #endif
-        var query = neverQuery(origin)
-        query[kSecMatchLimit] = kSecMatchLimitOne
-        return SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess
+        (try? withVault { try $0.containsNeverSave(origin) }) ?? false
     }
 
     func setNeverSave(_ never: Bool, on origin: Origin) {
-        #if DEBUG
-        if memory != nil { return }
-        #endif
-        let query = neverQuery(origin)
-        SecItemDelete(query as CFDictionary)
-        guard never else { return }
-        var item = query
-        item[kSecAttrSynchronizable] = synchronizable
-        item[kSecAttrAccessible] = kSecAttrAccessibleWhenUnlocked
-        item[kSecValueData] = Data()
-        SecItemAdd(item as CFDictionary, nil)
+        try? withVault { try $0.setNeverSave(never, on: origin) }
     }
 
     func neverSaveSites() -> [Origin] {
-        #if DEBUG
-        if memory != nil { return [] }
-        #endif
-        var query: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: Self.neverService + "." + label,
-                                      kSecUseDataProtectionKeychain: true, kSecAttrAccessGroup: Self.accessGroup,
-                                      kSecAttrSynchronizable: kSecAttrSynchronizableAny]
-        query[kSecMatchLimit] = kSecMatchLimitAll
-        query[kSecReturnAttributes] = true
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess, let items = result as? [[CFString: Any]] else { return [] }
-        return items.compactMap { ($0[kSecAttrAccount] as? String).flatMap { Origin(URL(string: $0)) } }
+        (try? withVault { try $0.loadNeverSaveSites() }) ?? []
     }
 
     /// Removes everything this store's label owns. Tests use it to clean up after themselves.
     func deleteAll() {
-        #if DEBUG
-        if memory != nil { memory = [:]; return }
-        #endif
-        var query = baseQuery()
-        query[kSecMatchLimit] = nil
-        SecItemDelete(query as CFDictionary)
-        let never: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: Self.neverService + "." + label,
-                                      kSecUseDataProtectionKeychain: true, kSecAttrAccessGroup: Self.accessGroup,
-                                      kSecAttrSynchronizable: kSecAttrSynchronizableAny]
-        SecItemDelete(never as CFDictionary)
-    }
-
-    // MARK: Keychain plumbing
-
-    private func baseQuery() -> [CFString: Any] {
-        [kSecClass: kSecClassInternetPassword,
-         kSecUseDataProtectionKeychain: true,
-         kSecAttrAccessGroup: Self.accessGroup,
-         kSecAttrLabel: label,
-         kSecAttrSynchronizable: kSecAttrSynchronizableAny]
-    }
-
-    private func neverQuery(_ origin: Origin) -> [CFString: Any] {
-        [kSecClass: kSecClassGenericPassword,
-         kSecAttrService: Self.neverService + "." + label,
-         kSecAttrAccount: origin.description,
-         kSecUseDataProtectionKeychain: true,
-         kSecAttrAccessGroup: Self.accessGroup,
-         kSecAttrSynchronizable: kSecAttrSynchronizableAny]
-    }
-
-    private func itemQuery(for id: UUID) throws -> [CFString: Any] {
-        // The ID lives in the item's comment, so one item can be found without reading any password.
-        var query = baseQuery()
-        query[kSecAttrComment] = id.uuidString
-        return query
-    }
-
-    private struct Details: Codable {
-        var title: String
-        var notes: String
-        var otpAuth: String
-        var created: Date
-        var modified: Date
-        var lastUsed: Date?
-        // Only on a strong password the site hasn't taken yet; older items have neither.
-        var pendingGenerated: Bool?
-        var generatedFor: String?
-    }
-
-    private func attributes(for credential: Credential) -> [CFString: Any] {
-        let details = Details(title: credential.title, notes: credential.notes, otpAuth: credential.otpAuth,
-                              created: credential.created, modified: credential.modified, lastUsed: credential.lastUsed,
-                              pendingGenerated: credential.isPendingGenerated ? true : nil,
-                              generatedFor: credential.isPendingGenerated && !credential.generatedFor.isEmpty ? credential.generatedFor : nil)
-        var item: [CFString: Any] = [
-            kSecClass: kSecClassInternetPassword,
-            kSecUseDataProtectionKeychain: true,
-            kSecAttrAccessGroup: Self.accessGroup,
-            kSecAttrSynchronizable: synchronizable,
-            // Readable while the Mac is unlocked; required for sync, and never needs Touch ID to fill.
-            kSecAttrAccessible: kSecAttrAccessibleWhenUnlocked,
-            kSecAttrLabel: label,
-            kSecAttrComment: credential.id.uuidString,
-            kSecAttrServer: credential.origin.host,
-            kSecAttrProtocol: credential.origin.scheme == "http" ? kSecAttrProtocolHTTP : kSecAttrProtocolHTTPS,
-            kSecAttrAccount: credential.username,
-            // Title, notes and dates, as JSON; internet-password items have no generic attribute.
-            kSecAttrDescription: (try? JSONEncoder().encode(details)).flatMap { String(data: $0, encoding: .utf8) } ?? "",
-        ]
-        if let port = credential.origin.port { item[kSecAttrPort] = port }
-        return item
-    }
-
-    private static func credential(from item: [CFString: Any]) -> Credential? {
-        guard let comment = item[kSecAttrComment] as? String, let id = UUID(uuidString: comment),
-              let host = item[kSecAttrServer] as? String else { return nil }
-        let scheme = (item[kSecAttrProtocol] as? String) == (kSecAttrProtocolHTTP as String) ? "http" : "https"
-        let port = (item[kSecAttrPort] as? Int).flatMap { $0 == 0 ? nil : $0 }
-        let details = (item[kSecAttrDescription] as? String).flatMap { try? JSONDecoder().decode(Details.self, from: Data($0.utf8)) }
-        let origin = Origin(scheme: scheme, host: host, port: port)
-        return Credential(id: id, origin: origin, username: item[kSecAttrAccount] as? String ?? "",
-                          title: details?.title ?? origin.displayName, notes: details?.notes ?? "", otpAuth: details?.otpAuth ?? "",
-                          created: details?.created ?? (item[kSecAttrCreationDate] as? Date ?? Date()),
-                          modified: details?.modified ?? (item[kSecAttrModificationDate] as? Date ?? Date()),
-                          lastUsed: details?.lastUsed, isPendingGenerated: details?.pendingGenerated ?? false,
-                          generatedFor: details?.generatedFor ?? "")
+        try? withVault { try $0.deleteAll() }
     }
 
     private func notify() {
